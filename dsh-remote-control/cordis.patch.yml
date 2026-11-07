@@ -1,0 +1,6 @@
+# dsh-remote-control bundle layer (safe boot manifest).
+# 每个 entries 都必须带 id；本插件只注入一个 host 行，config 交给 schema 默认值。
+- insert:
+    - id: dsh-remote-control
+      name: '@dsh-external/dsh-remote-control'
+      config: {}

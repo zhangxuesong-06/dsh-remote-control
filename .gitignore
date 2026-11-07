@@ -1,0 +1,31 @@
+# 工作区级忽略（本仓库根 = D:\DSH WorkSpace\远程控制）
+# 真正的插件源码在 dsh-remote-control/，其自身 .gitignore 另行生效。
+
+# ── 曾用于一次性排障的临时产物 ────────────────────────────────
+# 这些脚本/文本里带有真实 token 与内网地址，绝不能推送。
+build_agent_cmd*.js
+debug_agent_cmd*.js
+make_agent_cmd*.js
+build_transcript.js
+listener59000.js
+tunnel_server*.js
+agent_install_cmd*.txt
+_codex-*.txt
+_asar-*.mjs
+verify-install.mjs
+
+# ── 本地归档与会话记录（含明文凭据 / 个人信息）──────────────────
+对话归档_*/
+*.zip
+*.jsonl
+*.zstd
+
+# ── 权限修复与备份目录（本机环境专用）────────────────────────
+acl-recovery/
+plugin-backups/
+
+# ── 其它本机杂物 ────────────────────────────────────────────
+牢梅/
+.DS_Store
+Thumbs.db
+*.log
