@@ -77,7 +77,9 @@ export interface RemoteMachine {
 export interface MachineRegistry {
   version: 1;
   machines: RemoteMachine[];
-  /** Machine the UI/composer indicator treats as current; absent = this computer (local). */
+  /** Execution mode chosen in the UI: 'local' (default) or 'remote'. */
+  mode?: "local" | "remote";
+  /** Machine the UI/composer indicator treats as current (only meaningful when mode === 'remote'). */
   activeMachineId?: string;
 }
 
@@ -171,7 +173,12 @@ export function loadRegistry(file: string = defaultRegistryPath): MachineRegistr
     const activeMachineId = typeof rawActive === "string" && machines.some((m) => m.id === rawActive)
       ? rawActive
       : undefined;
-    return { version: 1, machines, ...(activeMachineId ? { activeMachineId } : {}) };
+    // Derive mode: explicit value wins; otherwise infer from activeMachineId for old files.
+    const rawMode = (parsed as Record<string, unknown>).mode;
+    const mode = rawMode === "local" || rawMode === "remote"
+      ? rawMode
+      : activeMachineId ? "remote" : "local";
+    return { version: 1, machines, mode, ...(activeMachineId ? { activeMachineId } : {}) };
   } catch (error) {
     throw new Error(`无法读取机器登记表，已拒绝覆盖现有数据：${error instanceof Error ? error.message : String(error)}`);
   }

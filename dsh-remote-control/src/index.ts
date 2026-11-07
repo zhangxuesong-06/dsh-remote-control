@@ -1644,11 +1644,10 @@ function applyInternal(ctx: Context, config: Config): void {
 
           if (method === "GET" && pathname === "/state") {
             const registry = readRegistry();
-            const active = registry.activeMachineId
-              ? registry.machines.find((m) => m.id === registry.activeMachineId)
-              : undefined;
+            const active = registry.machines.find((m) => m.id === registry.activeMachineId);
             return send(res, 200, {
               ok: true,
+              mode: active ? "remote" : (registry.mode === "remote" ? "remote" : "local"),
               active: active
                 ? {
                     id: active.id, name: active.name,
@@ -1666,19 +1665,44 @@ function applyInternal(ctx: Context, config: Config): void {
 
           if (method === "POST" && pathname === "/activate") {
             const body = JSON.parse(await readHttpBody(req) || "{}") as Record<string, unknown>;
-            const raw = body.machine === undefined || body.machine === null ? "" : String(body.machine).trim();
             const registry = readRegistry();
-            if (!raw) {
+            const rawMode = typeof body.mode === "string" ? body.mode.trim() : "";
+            const raw = body.machine === undefined || body.machine === null ? "" : String(body.machine).trim();
+
+            // 只切模式（本机 / 远程），不指定具体机器。
+            if (rawMode === "local") {
+              registry.mode = "local";
               registry.activeMachineId = undefined;
               save(registry);
-              return send(res, 200, { ok: true, active: null });
+              return send(res, 200, { ok: true, mode: "local", active: null });
+            }
+            if (rawMode === "remote" && !raw) {
+              registry.mode = "remote";
+              // 远程模式但未选机器：若已有机器，自动落到第一台可用电脑。
+              const first = registry.machines.find((m) => m.enabled !== false);
+              registry.activeMachineId = first ? first.id : undefined;
+              save(registry);
+              return send(res, 200, {
+                ok: true,
+                mode: "remote",
+                active: first ? { id: first.id, name: first.name, workspace: first.defaultCwd || first.workspace || null, platform: first.platform ?? null, enabled: first.enabled } : null,
+              });
+            }
+
+            if (!raw) {
+              registry.mode = "local";
+              registry.activeMachineId = undefined;
+              save(registry);
+              return send(res, 200, { ok: true, mode: "local", active: null });
             }
             const machine = registry.machines.find((m) => m.id === raw);
             if (!machine) return send(res, 404, { ok: false, error: `机器 "${raw}" 未登记` });
+            registry.mode = "remote";
             registry.activeMachineId = machine.id;
             save(registry);
             return send(res, 200, {
               ok: true,
+              mode: "remote",
               active: {
                 id: machine.id, name: machine.name,
                 workspace: machine.defaultCwd || machine.workspace || null,

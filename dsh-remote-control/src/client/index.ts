@@ -17,7 +17,30 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
       Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
 
       var react = require("react");
+      var primitives = (function () { try { return require("@deepseek-ai/dsh-client-ui-primitives"); } catch (e) { return null; } })();
+      var Menu = primitives && primitives.Menu;
       var h = react.createElement;
+
+      // 与权限按钮一致的 16px 图标（本机=显示器，远程=桌面），用 currentColor 继承文字色。
+      function targetGlyph(remote) {
+        if (remote) {
+          return h("svg", { width: 16, height: 16, viewBox: "0 0 16 16", fill: "none", "aria-hidden": true },
+            h("rect", { x: 1.6, y: 2.6, width: 12.8, height: 8.6, rx: 1.6, stroke: "currentColor", strokeWidth: 1.3 }),
+            h("path", { d: "M5.4 13.4h5.2", stroke: "currentColor", strokeWidth: 1.3, strokeLinecap: "round" }),
+          );
+        }
+        return h("svg", { width: 16, height: 16, viewBox: "0 0 16 16", fill: "none", "aria-hidden": true },
+          h("rect", { x: 1.8, y: 2.2, width: 12.4, height: 8.2, rx: 1.4, stroke: "currentColor", strokeWidth: 1.3 }),
+          h("path", { d: "M8 10.4v3.2M5.2 13.6h5.6", stroke: "currentColor", strokeWidth: 1.3, strokeLinecap: "round" }),
+        );
+      }
+      function chevron(open) {
+        return h("span", { className: "chev" + (open ? " open" : ""), "aria-hidden": true },
+          h("svg", { width: 14, height: 14, viewBox: "0 0 16 16", fill: "none" },
+            h("path", { d: "M4 6l4 4 4-4", stroke: "currentColor", strokeWidth: 1.4, strokeLinecap: "round", strokeLinejoin: "round" }),
+          ),
+        );
+      }
 
       var API = "/dsh-remote-control/api";
 
@@ -54,25 +77,20 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
         ".dshrc-badge.busy{background:rgba(255,153,51,.14);color:var(--dsw-alias-label-primary);border-color:transparent}",
         ".dshrc-check{display:flex;align-items:center;gap:6px;padding:6px 0}",
         ".dshrc-actions{display:flex;gap:6px}",
-        // ── 输入框上方目标指示器 ──
-        ".dshrc-target{position:relative;display:flex;justify-content:flex-start;padding:0 2px}",
-        ".dshrc-target-chip{display:inline-flex;align-items:center;gap:7px;max-width:100%;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-radius:999px;padding:4px 11px;font-size:12px;line-height:1.4;cursor:pointer;font:inherit;font-size:12px}",
-        ".dshrc-target-chip:hover{border-color:var(--dsw-alias-state-business-primary)}",
-        ".dshrc-target-chip .dot{width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-label-tertiary);flex:none}",
-        ".dshrc-target-chip .dot.remote{background:#3964fe}",
-        ".dshrc-target-chip .dot.offline{background:#e74c3c}",
-        ".dshrc-target-chip .seg{opacity:.55;flex:none}",
-        ".dshrc-target-chip .val{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:38vw}",
-        ".dshrc-target-chip .caret{opacity:.5;font-size:10px}",
-        ".dshrc-target-menu{position:absolute;left:0;bottom:calc(100% + 6px);z-index:60;min-width:300px;max-height:min(60vh,420px);overflow:auto;background:var(--dsw-alias-bg-layer-1,#fff);border:1px solid var(--dsw-alias-border-l2);border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.18);padding:6px}",
-        ".dshrc-target-menu .hdr{font-size:11px;color:var(--dsw-alias-label-tertiary);padding:6px 10px 4px}",
-        ".dshrc-target-opt{display:flex;align-items:center;gap:8px;width:100%;text-align:left;border:0;background:transparent;color:var(--dsw-alias-label-primary);border-radius:8px;padding:8px 10px;cursor:pointer;font:inherit;font-size:12px}",
-        ".dshrc-target-opt:hover{background:var(--dsw-alias-bg-layer-3)}",
-        ".dshrc-target-opt.active{background:var(--dsw-alias-bg-layer-3)}",
-        ".dshrc-target-opt .nm{font-weight:600}",
-        ".dshrc-target-opt .sub{font-size:11px;color:var(--dsw-alias-label-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
-        ".dshrc-target-opt .col{display:flex;flex-direction:column;gap:2px;min-width:0;flex:1}",
-        ".dshrc-target-opt .tick{color:#3964fe;font-weight:700}",
+        // ── 聊天框工具行内的目标 chip：数值与「权限按钮」同源 ──
+        // 高度/圆角/字号/配色/间距取自 PermissionSelect.module.css；宽度按内容自适应。
+        ".dshrc-ctl-root{display:inline-flex;align-items:center;align-self:center;flex:0 0 auto;height:28px;line-height:0;vertical-align:middle}",
+        ".dshrc-ctl-trigger{display:inline-flex;align-items:center;gap:4px;min-width:0;max-width:180px;height:28px;box-sizing:border-box;padding:0 4px 0 6px;border:none;border-radius:24px;outline:none;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;line-height:20px;font-weight:500;cursor:pointer;flex:0 0 auto;align-self:center;vertical-align:middle}",
+        ".dshrc-ctl-trigger:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}",
+        ".dshrc-ctl-trigger:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3)}",
+        ".dshrc-ctl-trigger:disabled{color:var(--dsw-alias-label-dimmed);cursor:default}",
+        ".dshrc-ctl-trigger .ico{display:inline-flex;flex:0 0 auto}",
+        ".dshrc-ctl-trigger .ico svg{width:14px;height:14px}",
+        ".dshrc-ctl-trigger .txt{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+        ".dshrc-ctl-trigger .chev{display:inline-flex;flex:0 0 auto;color:var(--dsw-alias-label-caption);transition:transform 120ms ease}",
+        ".dshrc-ctl-trigger .chev.open{transform:rotate(180deg)}",
+        // 远程模式但尚未选择电脑：用提示色，弱化但仍可点。
+        ".dshrc-ctl-trigger.dshrc-ctl-missing{color:var(--dsw-alias-label-tertiary)}",
         // ── 面板样式 ──
         ".dshrc-card{border:1px solid var(--dsw-alias-border-l2);border-radius:12px;padding:14px;background:var(--dsw-alias-bg-layer-2);display:flex;flex-direction:column;gap:10px}",
         ".dshrc-cardhead{display:flex;align-items:center;justify-content:space-between;gap:8px}",
@@ -111,21 +129,26 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
         return Number.isNaN(date.getTime()) ? "（时间未知）" : date.toLocaleString();
       }
 
-      // ── 输入框上方的当前目标（本机 / 远程电脑 · 工作区）──────────────────────
-      function TargetIndicator() {
-        var stateHook = react.useState({ active: null, machines: [] });
-        var state = stateHook[0];
-        var setState = stateHook[1];
+      // ── 聊天框工具行内的目标选择器 ──
+      // 视觉与「模型/权限」按钮一致；显示逻辑参考 Codex：触发器显示当前环境，
+      // 点开一个列表，本机与所有电脑平铺、选中打勾。
+      function TargetControls() {
+        var modelHook = react.useState({ mode: "local", active: null, machines: [] });
+        var state = modelHook[0];
+        var setState = modelHook[1];
         var openHook = react.useState(false);
         var open = openHook[0];
         var setOpen = openHook[1];
+        var hostOpenHook = react.useState(false);
+        var hostOpen = hostOpenHook[0];
+        var setHostOpen = hostOpenHook[1];
 
         function load() {
           fetchJson("/state")
             .then(function (data) {
-              if (data && data.ok) setState({ active: data.active || null, machines: data.machines || [] });
+              if (data && data.ok) setState({ mode: data.mode || "local", active: data.active || null, machines: data.machines || [] });
             })
-            .catch(function () { /* 指示器永不阻断输入 */ });
+            .catch(function () { /* 控件永不阻断输入 */ });
         }
 
         react.useEffect(function () {
@@ -136,88 +159,93 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
           return function () { window.clearInterval(timer); window.removeEventListener("focus", onFocus); };
         }, []);
 
-        react.useEffect(function () {
-          if (!open || typeof document === "undefined") return undefined;
-          function onDown(event) {
-            if (event.target && typeof event.target.closest === "function" && event.target.closest(".dshrc-target")) return;
-            setOpen(false);
-          }
-          document.addEventListener("mousedown", onDown);
-          return function () { document.removeEventListener("mousedown", onDown); };
-        }, [open]);
+        // 外点关闭由官方 Menu 组件内部处理（它会同时排除 anchor 与 portal 列表），
+        // 这里不再自建 mousedown 监听，否则会在 click 之前把菜单卸载掉导致点击无效。
 
-        function activate(machineId) {
-          fetchJson("/activate", { method: "POST", body: JSON.stringify({ machine: machineId || "" }) })
+        function post(payload) {
+          return fetchJson("/activate", { method: "POST", body: JSON.stringify(payload) })
             .then(function (data) {
-              if (data && data.ok) setState(function (prev) {
-                return { active: data.active || null, machines: prev.machines };
-              });
+              if (data && data.ok) {
+                setState(function (prev) { return { mode: data.mode || prev.mode, active: data.active || null, machines: prev.machines }; });
+              }
             })
-            .catch(function () { /* 失败保持原目标 */ })
-            .then(function () { setOpen(false); });
+            .catch(function () { /* 失败保持原状态 */ });
+        }
+        function chooseMode(mode) { setOpen(false); setHostOpen(false); return post({ mode: mode }); }
+        function chooseMachine(id) {
+          setOpen(false); setHostOpen(false);
+          if (id === "__settings__") return; // 引导项：不切换，仅作提示
+          return post({ mode: "remote", machine: id || "" });
         }
 
+        var isRemote = state.mode === "remote";
         var active = state.active;
-        var label = active ? "远程" : "本机";
-        var dotClass = "dot" + (active ? (active.enabled === false ? " offline" : " remote") : "");
-        var detail = active
-          ? active.name + (active.workspace ? " · " + active.workspace : " · 未选择工作区")
-          : "这台电脑";
+        var machines = state.machines || [];
 
-        var chip = h("button", {
+        // ① 模式按钮（时刻显示）：本机 / 远程。
+        var modeLabel = isRemote ? "远程" : "本机";
+        var modeItems = [
+          { id: "local", label: "本机" },
+          { id: "remote", label: "远程电脑" },
+        ];
+        var modeTrigger = h("button", {
           type: "button",
-          className: "dshrc-target-chip",
-          title: "当前目标：点击切换（仅为工具默认目标，不改变命令权限）",
-          onClick: function () { setOpen(function (v) { return !v; }); },
+          className: "dshrc-ctl-trigger",
+          title: "执行位置：本机 / 远程电脑（仅为工具默认目标，不改变命令权限）",
+          "aria-haspopup": "menu",
+          "aria-expanded": open,
+          onClick: function () { setHostOpen(false); setOpen(function (v) { return !v; }); },
         },
-          h("span", { className: dotClass }),
-          h("span", { className: "seg" }, label),
-          h("span", { className: "val" }, detail),
-          h("span", { className: "caret" }, "▾"),
+          h("span", { className: "ico", "aria-hidden": true }, targetGlyph(isRemote)),
+          h("span", { className: "txt" }, modeLabel),
+          chevron(open),
         );
+        var modeControl = Menu
+          ? h(Menu, {
+              open: open, anchor: modeTrigger, items: modeItems,
+              selectedId: isRemote ? "remote" : "local",
+              side: "top", align: "start", portal: true, dense: true, className: "dshrc-ctl-root",
+              onSelect: function (id) { chooseMode(id); },
+              onClose: function () { setOpen(false); },
+            })
+          : modeTrigger;
 
-        var menu = null;
-        if (open) {
-          var options = [
-            h("button", {
-              key: "__local__",
-              type: "button",
-              className: "dshrc-target-opt" + (active ? "" : " active"),
-              onClick: function () { activate(""); },
-            },
-              h("span", { className: "col" },
-                h("span", { className: "nm" }, "本机"),
-                h("span", { className: "sub" }, "在运行 DSH 的这台电脑上执行"),
-              ),
-              active ? null : h("span", { className: "tick" }, "✓"),
-            ),
-          ];
-          if (state.machines.length === 0) {
-            options.push(h("div", { key: "__none__", className: "hdr" }, "还没有登记远程电脑；可在 设置 → 远程控制 添加。"));
-          }
-          state.machines.forEach(function (m) {
-            var isActive = active && active.id === m.id;
-            options.push(h("button", {
-              key: m.id,
-              type: "button",
-              className: "dshrc-target-opt" + (isActive ? " active" : ""),
-              onClick: function () { activate(m.id); },
-            },
-              h("span", { className: "col" },
-                h("span", { className: "nm" }, m.name + (m.name !== m.id ? " (" + m.id + ")" : "")),
-                h("span", { className: "sub" }, (m.enabled === false ? "已停用 · " : "") + (m.workspace || "未选择工作区")),
-              ),
-              isActive ? h("span", { className: "tick" }, "✓") : null,
-            ));
-          });
-          menu = h("div", { className: "dshrc-target-menu" },
-            h("div", { className: "hdr" }, "选择这次会话的工作目标"),
-            options,
-            h("div", { className: "hdr" }, "仅作为工具的默认目标，不会改变命令权限或隔离环境。"),
+        // ② 电脑按钮：仅远程模式出现；无登记电脑时显示“未选择”，但仍可点开看到引导。
+        var hostControl = null;
+        if (isRemote) {
+          var hasMachines = machines.length > 0;
+          var hostLabel = active ? (active.name || active.id) : (hasMachines ? "选择电脑" : "未选择电脑");
+          var hostItems = hasMachines
+            ? machines.map(function (m) {
+                return { id: m.id, label: m.name + (m.name !== m.id ? " (" + m.id + ")" : ""), disabled: m.enabled === false };
+              })
+            : [
+                { type: "label", id: "__hint__", text: "还没有登记远程电脑" },
+                { id: "__settings__", label: "前往 设置 → 远程控制 添加" },
+              ];
+          var hostTrigger = h("button", {
+            type: "button",
+            className: "dshrc-ctl-trigger" + (active ? "" : " dshrc-ctl-missing"),
+            title: hasMachines ? (active ? "点击切换目标电脑" : "选择远程电脑") : "还没有登记远程电脑，点此查看如何添加",
+            "aria-haspopup": "menu",
+            "aria-expanded": hostOpen,
+            onClick: function () { setOpen(false); setHostOpen(function (v) { return !v; }); },
+          },
+            h("span", { className: "txt" }, hostLabel),
+            chevron(hostOpen),
           );
+          hostControl = Menu
+            ? h(Menu, {
+                open: hostOpen, anchor: hostTrigger, items: hostItems,
+                selectedId: active ? active.id : undefined,
+                side: "top", align: "start", portal: true, dense: true, className: "dshrc-ctl-root",
+                onSelect: function (id) { chooseMachine(id); },
+                onClose: function () { setHostOpen(false); },
+              })
+            : hostTrigger;
         }
 
-        return h("div", { className: "dshrc-target" }, chip, menu);
+        return h(react.Fragment, null, modeControl, hostControl);
       }
 
       function RemoteControlSection() {
@@ -454,19 +482,19 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
             // 控制台都不可用时彻底静默。
           }
         }
-        // 输入框上方的目标指示器（Codex 风格状态条）。独立 try：
+        // 聊天框工具行内的紧凑控件（Codex 风格）。独立 try：
         // 插槽缺失或渲染异常都不影响输入框与其它插件。
         try {
           ctx.effect(function () {
-            return ctx.slots.inject("conversation.input.dock", function () {
+            return ctx.slots.inject("conversation.input.left", function () {
               return ctx.slots.register({
-                name: "conversation.input.dock",
+                name: "conversation.input.left",
                 id: "dsh-remote-control-target",
-                order: -10,
+                order: 0,
                 locale: "dshRemoteControl",
-              }, function () { return h(TargetIndicator); });
+              }, function () { return h(TargetControls); });
             });
-          }, "dsh-remote-control: target indicator");
+          }, "dsh-remote-control: target controls");
         } catch (error) {
           try {
             console.error("[dsh-remote-control] 目标指示器注册失败（已降级，不影响输入框）:", error);

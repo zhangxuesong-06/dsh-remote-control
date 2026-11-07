@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-remote-control",
-  "version": "0.7.0",
+  "version": "0.7.10",
   "description": "让本机 DeepSeek Harness 远程控制其它电脑：设置页远程控制面板 + 一键连接、机器管理、远程命令/文件/进程操作。",
   "private": true,
   "type": "module",
@@ -28,7 +28,8 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-ui-slots"
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-primitives"
       ]
     }
   },

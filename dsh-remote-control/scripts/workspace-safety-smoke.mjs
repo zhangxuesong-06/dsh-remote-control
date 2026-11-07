@@ -72,8 +72,14 @@ try {
     apiSpec.handler(req, res);
   });
   let state = await callApi('/state', 'GET');
-  assert.equal(state.active.id, 'a'); pass('current target follows the machine last used');
+  assert.equal(state.active.id, 'a'); assert.equal(state.mode, 'remote'); pass('current target follows the machine last used');
+  const modeLocal = await callApi('/activate', 'POST', { mode: 'local' });
+  assert.equal(modeLocal.mode, 'local'); assert.equal(modeLocal.active, null);
+  assert.equal((await callApi('/state', 'GET')).mode, 'local'); pass('explicit local mode clears the target');
+  const modeRemote = await callApi('/activate', 'POST', { mode: 'remote' });
+  assert.equal(modeRemote.mode, 'remote'); pass('remote mode selects the first available host');
   assert.equal((await callApi('/activate', 'POST', { machine: 'b' })).active.id, 'b');
+  assert.equal((await callApi('/activate', 'POST', { machine: 'b' })).mode, 'remote'); pass('choosing a host keeps remote mode');
   await invoke('remote_exec', { command: 'pwd' });
   assert.equal(captured.at(-1).cwd, '/other'); pass('selected host becomes the default target');
   await invoke('remote_exec', { machine: 'a', command: 'pwd' });
