@@ -100,6 +100,16 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
         ".dshrc-item.current{border-color:#3964fe;box-shadow:0 0 0 1px #3964fe inset}",
         ".dshrc-btn.sm{padding:4px 10px;font-size:12px}",
         ".dshrc-kv{font-size:11px;color:var(--dsw-alias-label-tertiary)}",
+        // ── 隧道帮助块 ──
+        ".dshrc-tunnel{border:1px dashed var(--dsw-alias-border-l2);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:8px;background:var(--dsw-alias-bg-layer-1)}",
+        ".dshrc-tunnel .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
+        ".dshrc-tunnel .cnt{font-size:12px;color:var(--dsw-alias-label-secondary);flex:1;min-width:120px}",
+        ".dshrc-tunnel select{font:inherit;font-size:12px;padding:3px 6px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-primary)}",
+        ".dshrc-code{position:relative;background:var(--dsw-alias-bg-layer-3);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px 34px 8px 10px;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:var(--dsw-alias-label-secondary);max-height:150px;overflow:auto}",
+        ".dshrc-code .copy{position:absolute;top:6px;right:6px}",
+        ".dshrc-tunnel .note{font-size:11px;color:var(--dsw-alias-label-tertiary);line-height:1.6}",
+        ".dshrc-step{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:var(--dsw-alias-label-primary);margin-top:6px}",
+        ".dshrc-step .dshrc-stepnum{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:var(--dsw-alias-state-business-primary,#3964fe);color:#fff;font-size:11px;flex:none}",
       ].join("");
 
       var tagId = "dsh-remote-control/main.css";
@@ -127,6 +137,230 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
         if (!value) return "（尚无记录）";
         var date = new Date(value);
         return Number.isNaN(date.getTime()) ? "（时间未知）" : date.toLocaleString();
+      }
+
+      // 复制文本到剪贴板（尽量不依赖权限，失败静默）。
+      function copyText(text) {
+        try {
+          if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+            void navigator.clipboard.writeText(text);
+            return true;
+          }
+          var ta = document.createElement("textarea");
+          ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+          document.body.appendChild(ta); ta.select();
+          var ok = document.execCommand && document.execCommand("copy");
+          document.body.removeChild(ta);
+          return Boolean(ok);
+        } catch (e) { return false; }
+      }
+
+      // 从本机 SSH 配置发现电脑（~/.ssh/config、known_hosts），一键加入。
+      function DiscoverHelp(props) {
+        var setMsg = props.setMsg;
+        var [open, setOpen] = react.useState(false);
+        var [hosts, setHosts] = react.useState(null);
+        var [keys, setKeys] = react.useState([]);
+        var [busyId, setBusyId] = react.useState("");
+
+        function scan() {
+          setOpen(true);
+          fetchJson("/discover").then(function (r) {
+            if (r && r.ok) { setHosts(r.hosts || []); setKeys(r.keys || []); }
+            else setHosts([]);
+          }).catch(function () { setHosts([]); });
+        }
+        function add(h2) {
+          setBusyId(h2.host);
+          fetchJson("/discover/add", { method: "POST", body: JSON.stringify({ host: h2.host, port: h2.port, user: h2.user, alias: h2.alias }) })
+            .then(function (r) {
+              setBusyId("");
+              if (r && r.ok) { setMsg({ text: r.skipped ? "已在列表：" + h2.host : "已加入：" + h2.host, err: false }); if (props.onAdded) props.onAdded(); }
+              else setMsg({ text: "加入失败：" + ((r && r.error) || "未知"), err: true });
+            })
+            .catch(function (e) { setBusyId(""); setMsg({ text: String(e), err: true }); });
+        }
+
+        return h("div", { className: "dshrc-tunnel" },
+          h("div", { className: "row" },
+            h("span", { className: "cnt" }, "检测到本机 SSH 里连过的电脑，可一键加入，不用重新输入地址和账号。"),
+            h("button", { className: "dshrc-btn sm", onClick: scan }, open ? "重新扫描" : "发现本机已保存的电脑"),
+          ),
+          open
+            ? (hosts === null
+                ? h("div", { className: "note" }, "扫描中…")
+                : hosts.length === 0
+                  ? h("div", { className: "note" }, "没有发现：先用系统 ssh 连过一次目标机，或在下方手动填写。")
+                  : h("div", null,
+                      hosts.map(function (h2) {
+                        return h("div", { className: "row", key: h2.host + ":" + (h2.port || 22), style: { padding: "4px 0", borderTop: "1px dotted var(--dsw-alias-border-l2)" } },
+                          h("span", { className: "cnt", style: { fontFamily: "ui-monospace,monospace" } },
+                            h2.host + (h2.port ? ":" + h2.port : "") + (h2.user ? "  " + h2.user : "  （用户名未知）")),
+                          h("button", { className: "dshrc-btn sm", disabled: busyId === h2.host, onClick: function () { add(h2); } }, busyId === h2.host ? "加入中…" : "加入"),
+                        );
+                      }),
+                      keys.length ? h("div", { className: "note" }, "可用密钥：" + keys.join(", ")) : null,
+                    ))
+            : null,
+        );
+      }
+
+      // SSH 首次连接引导：用户在目标机执行「一条命令」即可，三平台自选。
+      function SshHelp(props) {
+        var setMsg = props.setMsg;
+        var [guide, setGuide] = react.useState(null);
+        var [verifying, setVerifying] = react.useState(false);
+        var [verified, setVerified] = react.useState(null);   // null | {ok, text}
+        var [os, setOs] = react.useState("linux");            // linux | windows | macos
+        var [guideErr, setGuideErr] = react.useState(null);
+
+        react.useEffect(function () {
+          fetchJson("/ssh/guide")
+            .then(function (r) { if (r && r.ok) { setGuide(r); setGuideErr(null); } else setGuideErr((r && r.error) || "无法生成公钥"); })
+            .catch(function (e) { setGuideErr(String(e)); });
+        }, []);
+
+        function doVerify() {
+          setVerifying(true);
+          setVerified(null);
+          fetchJson("/ssh/verify", { method: "POST", body: JSON.stringify({ id: props.machineId || "" }) })
+            .then(function (r) {
+              setVerifying(false);
+              if (r && r.ok) {
+                setVerified({ ok: r.connected, text: r.detail, file: r.verifyFile, time: r.verifyTime });
+                if (r.connected) setMsg({ text: "SSH 连接成功！已在目标机写入验证文件，可以直接在它上面工作了。", err: false });
+              } else {
+                setVerified({ ok: false, text: (r && r.error) || "验证失败" });
+              }
+            })
+            .catch(function (e) { setVerifying(false); setVerified({ ok: false, text: String(e) }); });
+        }
+
+        function copyCmd(text) {
+          if (copyText(text)) setMsg({ text: "命令已复制。到目标机打开终端，粘贴回车即可（会要你输一次系统密码）。", err: false });
+          else setMsg({ text: "复制失败，请手动全选复制。", err: true });
+        }
+
+        var cmds = guide ? guide.commands : null;
+        var cmdToShow = cmds ? (cmds[os] || "") : "";
+        var osLabel = { linux: "Linux", windows: "Windows", macos: "macOS" };
+
+        return h("div", { className: "dshrc-tunnel" },
+          h("div", { className: "dshrc-label", style: { fontWeight: 600, marginBottom: "4px" } },
+            "首次连接：在目标机执行一条命令，之后永久免密"),
+          h("div", { className: "note", style: { marginBottom: "6px" } },
+            "命令会自动开启 SSH 服务并授权本机，不需要去系统设置里翻找。"),
+
+          h("div", { className: "row" },
+            h("span", { className: "cnt", style: { flex: "none" } }, "目标机系统："),
+            ["linux", "windows", "macos"].map(function (key) {
+              return h("button", {
+                key: key,
+                className: "dshrc-btn sm" + (os === key ? " primary" : ""),
+                onClick: function () { setOs(key); },
+              }, osLabel[key]);
+            }),
+          ),
+
+          guideErr
+            ? h("div", { className: "note", style: { color: "var(--dsw-alias-state-error-primary)" } }, "生成公钥失败：" + guideErr)
+            : h("div", null,
+                h("div", { className: "dshrc-code" },
+                  cmdToShow,
+                  h("button", { className: "dshrc-btn sm copy", onClick: function () { copyCmd(cmdToShow); } }, "复制"),
+                ),
+                os === "windows"
+                  ? h("div", { className: "note" }, "在目标机按 Win+X → Windows PowerShell（或搜索 PowerShell）打开终端，粘贴回车；会弹出一次管理员授权，点『是』。")
+                  : os === "macos"
+                    ? h("div", { className: "note" }, "在目标机打开「终端」App（Command+空格 搜 Terminal），粘贴回车，输入一次系统密码。")
+                    : h("div", { className: "note" }, "在目标机打开终端，粘贴回车，输入一次 sudo 密码。"),
+              ),
+
+          props.machineId
+            ? h("div", { className: "row", style: { borderTop: "1px dashed var(--dsw-alias-border-l2)", paddingTop: "8px" } },
+                h("span", { className: "cnt" }, "执行完上面的命令后，点这里完成连接："),
+                h("button", { className: "dshrc-btn sm primary", disabled: verifying, onClick: doVerify }, verifying ? "验证中…" : "验证连接"),
+              )
+            : h("div", { className: "note" }, "先在下方点「保存」，保存后再点「验证连接」。"),
+
+          verified
+            ? h("div", { className: "note", style: {
+                color: verified.ok ? "var(--dsw-alias-state-success-primary)" : "var(--dsw-alias-state-error-primary)",
+              } },
+                verified.ok ? "✅ " + verified.text : "❌ " + verified.text)
+            : null,
+          verified && verified.ok && verified.file
+            ? h("div", { className: "note", style: { color: "var(--dsw-alias-state-success-primary)" } },
+                "已在目标机写入：", h("code", null, verified.file),
+                verified.time ? "（" + verified.time + "）" : "")
+            : null,
+        );
+      }
+
+      // 公网隧道帮助：按目标机系统给出安装+启动命令，并提供一键为本机安装。
+      function TunnelHelp(props) {
+        var setMsg = props.setMsg;
+        var [os, setOs] = react.useState("auto");
+        var [guide, setGuide] = react.useState(null);
+        var [installing, setInstalling] = react.useState(false);
+        var [installLog, setInstallLog] = react.useState(null);
+
+        react.useEffect(function () {
+          fetchJson("/cloudflared/guide?os=" + encodeURIComponent(os))
+            .then(function (r) { if (r && r.ok && r.guide) setGuide(r.guide); })
+            .catch(function () { /* 忽略 */ });
+        }, [os]);
+
+        function doInstallLocal() {
+          setInstalling(true);
+          setInstallLog(null);
+          fetchJson("/cloudflared/install", { method: "POST" })
+            .then(function (r) {
+              setInstalling(false);
+              var lines = (r && r.log) || ["无输出"];
+              setInstallLog(lines.join("\n"));
+              if (r && r.ok) setMsg({ text: "本机 cloudflared 已安装，可以直接启动隧道。", err: false });
+              else setMsg({ text: "自动安装未完成，请按下方命令手动安装。", err: true });
+            })
+            .catch(function (e) { setInstalling(false); setInstallLog("请求失败：" + String(e)); });
+        }
+
+        var g = guide;
+        var installCmd = g ? g.install.join("\n") : "";
+        var runCmd = g ? g.run.join("\n") : "";
+
+        return h("div", { className: "dshrc-tunnel" },
+          h("div", { className: "row" },
+            h("span", { className: "cnt" }, "目标机需要安装 cloudflared 才能建立公网隧道。选择它的系统查看安装命令："),
+            h("select", { value: os, onChange: function (e) { setOs(e.target.value); } },
+              h("option", { value: "auto" }, "自动/通用"),
+              h("option", { value: "win32" }, "Windows"),
+              h("option", { value: "linux" }, "Linux"),
+              h("option", { value: "darwin" }, "macOS"),
+            ),
+          ),
+          g
+            ? h("div", null,
+                h("div", { className: "dshrc-label", style: { marginBottom: "4px" } }, "① 在目标机安装"),
+                h("div", { className: "dshrc-code" },
+                  installCmd,
+                  h("button", { className: "dshrc-btn sm copy", onClick: function () { if (copyText(installCmd)) setMsg({ text: "安装命令已复制", err: false }); } }, "复制"),
+                ),
+                h("div", { className: "dshrc-label", style: { margin: "8px 0 4px" } }, "② 启动隧道并复制生成的 https 地址"),
+                h("div", { className: "dshrc-code" },
+                  runCmd,
+                  h("button", { className: "dshrc-btn sm copy", onClick: function () { if (copyText(runCmd)) setMsg({ text: "启动命令已复制", err: false }); } }, "复制"),
+                ),
+                g.note ? h("div", { className: "note" }, g.note) : null,
+              )
+            : h("div", { className: "note" }, "加载安装指引中…"),
+          h("div", { className: "row", style: { borderTop: "1px dashed var(--dsw-alias-border-l2)", paddingTop: "8px" } },
+            h("span", { className: "cnt" }, "如果目标机就是这台电脑，可以一键安装："),
+            h("button", { className: "dshrc-btn sm", disabled: installing, onClick: doInstallLocal }, installing ? "安装中…" : "为本机安装 cloudflared"),
+            h("button", { className: "dshrc-btn sm", onClick: function () { fetchJson("/cloudflared/status").then(function (r) { setMsg({ text: r && r.installed ? "本机已安装 cloudflared" + (r.version ? "（" + r.version + "）" : "") : "本机未检测到 cloudflared", err: !(r && r.installed) }); }).catch(function () {}); } }, "检测本机"),
+          ),
+          installLog ? h("div", { className: "dshrc-code" }, installLog) : null,
+        );
       }
 
       // ── 聊天框工具行内的目标选择器 ──
@@ -249,12 +483,13 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
       }
 
       function RemoteControlSection() {
-        var [form, setForm] = react.useState({ name: "", host: "", username: "", password: "", os: "auto", port: "5188", localWorkspace: "", tunnelUrl: "", autoConnect: false });
+        var [form, setForm] = react.useState({ id: "", name: "", host: "", username: "", password: "", os: "auto", port: "5188", sshPort: "22", transport: "ssh", workspace: "", tunnelUrl: "", autoConnect: false });
         var [busy, setBusy] = react.useState("");
         var [msg, setMsg] = react.useState(null);
         var [machines, setMachines] = react.useState([]);
         var [statuses, setStatuses] = react.useState({});
         var [activeId, setActiveId] = react.useState(null);
+        var [savedId, setSavedId] = react.useState("");
 
         function setActive(machineId) {
           fetchJson("/activate", { method: "POST", body: JSON.stringify({ machine: machineId || "" }) })
@@ -311,9 +546,9 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
           fetchJson("/save", { method: "POST", body: JSON.stringify(form) })
             .then(function (r) {
               setMsg(r && r.ok
-                ? { text: "已保存组合 " + r.machine.id + "（本机工作区：" + r.machine.localWorkspace + "）", err: false }
+                ? { text: "已保存：" + r.machine.id + "（下面点『验证连接』完成首次授权）", err: false }
                 : { text: "保存失败：" + ((r && r.error) || "未知错误"), err: true });
-              if (r && r.ok) setTimeout(refresh, 400);
+              if (r && r.ok) { setSavedId(r.machine.id); setTimeout(refresh, 400); }
             })
             .catch(function (e) { setMsg({ text: "请求失败：" + String(e), err: true }); })
             .finally(function () { setBusy(""); });
@@ -349,6 +584,19 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
             .finally(function () { setBusy(""); setTimeout(refresh, 1500); });
         }
 
+        function doEdit(m) {
+          // 把该机器数据填回上方表单，改完点「保存」即更新（id 不变）。
+          setForm({
+            id: m.id, name: m.name || "", host: m.host || "", username: m.username || "",
+            password: "", os: m.osHint || "auto", port: String(m.port || 5188),
+            sshPort: String(m.sshPort || 22), transport: m.transport || "ssh",
+            workspace: m.workspace || "", tunnelUrl: m.tunnelUrl || "", autoConnect: Boolean(m.autoConnect),
+          });
+          setSavedId(m.id);
+          setMsg({ text: "正在编辑「" + m.id + "」：改完点上方「保存」即可更新。", err: false });
+          if (typeof window !== "undefined") window.scrollTo({ top: 0, behavior: "smooth" });
+        }
+
         function doRemove(m) {
           if (!window.confirm("移除组合 \"" + m.id + "\"？")) return;
           setBusy("remove-" + m.id);
@@ -359,6 +607,17 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
             })
             .catch(function (e) { setMsg({ text: "请求失败：" + String(e), err: true }); })
             .finally(function () { setBusy(""); });
+        }
+
+        function doVerifyMachine(m) {
+          setBusy("verify-" + m.id);
+          fetchJson("/ssh/verify", { method: "POST", body: JSON.stringify({ id: m.id }) })
+            .then(function (r) {
+              if (r && r.ok && r.connected) setMsg({ text: "✅ " + m.id + " 连接成功，可以直接在它上面工作了。", err: false });
+              else setMsg({ text: "❌ " + m.id + " 未连通：" + ((r && (r.detail || r.error)) || "未知") + "\n（多半是还没装公钥——展开上面的『首次连接』步骤 2，把命令复制到目标机执行）", err: true });
+            })
+            .catch(function (e) { setMsg({ text: "验证失败：" + String(e), err: true }); })
+            .finally(function () { setBusy(""); setTimeout(refresh, 600); });
         }
 
         var items = machines.map(function (m) {
@@ -382,10 +641,9 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
                 m.autoConnect ? h("span", { className: "dshrc-badge" }, "自动连接") : null,
                 isActive ? h("span", { className: "dshrc-badge on" }, "当前目标") : null,
               ),
-              h("div", { className: "meta" }, (m.tunnelUrl ? "隧道：" + m.tunnelUrl + "  " : "") + m.host + ":" + m.port + "  远程工作区：" + (m.workspace || "（上线自动同步）")),
-              h("div", { className: "meta" }, "本机工作区：" + (m.localWorkspace || "（未设置）") + (m.hasPassword ? "  ·  密码已保存" : "  ·  密码留空")),
+              h("div", { className: "meta" }, (m.tunnelUrl ? "隧道：" + m.tunnelUrl + "  " : "") + m.host + ":" + m.port + "  目标机工作区：" + (m.workspace || "（上线自动同步）") + (m.hasPassword ? "  ·  密码已保存" : "  ·  密码留空")),
               h("div", { className: "meta" }, "主机名：" + (m.lastHostname || "（未探测）") + "  ·  agent：" + (m.lastAgentVersion || "（未知）") + "  ·  最后在线：" + formatTimestamp(lastSeen)),
-              h("div", { className: "meta", title: m.defaultCwd || "" }, "默认执行目录：" + (m.defaultCwd || "（使用远程工作区）")),
+              h("div", { className: "meta", title: m.defaultCwd || "" }, "默认执行目录：" + (m.defaultCwd || "（使用目标机工作区）")),
               envKeys.length > 0 ? h("div", { className: "meta", title: envKeys.join(", ") }, "默认环境变量名：" + envKeys.join(", ")) : null,
               status && status.text ? h("div", { className: "meta", title: status.text }, status.text + (status.checkedAt ? "  ·  检查于 " + formatTimestamp(status.checkedAt) : "")) : null,
             ),
@@ -393,7 +651,9 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
               isActive
                 ? h("button", { className: "dshrc-btn", onClick: function () { setActive(null); } }, "切回本机")
                 : h("button", { className: "dshrc-btn", onClick: function () { setActive(m.id); } }, "设为当前"),
-              h("button", { className: "dshrc-btn primary", disabled: busy === "connect-" + m.id, onClick: function () { doConnectOne(m); } }, "连接"),
+              h("button", { className: "dshrc-btn", onClick: function () { doEdit(m); } }, "编辑"),
+              h("button", { className: "dshrc-btn primary", disabled: busy === "verify-" + m.id, onClick: function () { doVerifyMachine(m); } }, busy === "verify-" + m.id ? "验证中…" : "验证连接"),
+              m.transport !== "ssh" ? h("button", { className: "dshrc-btn", disabled: busy === "connect-" + m.id, onClick: function () { doConnectOne(m); } }, "连接") : null,
               h("button", { className: "dshrc-btn danger", disabled: busy === "remove-" + m.id, onClick: function () { doRemove(m); } }, "移除"),
             ),
           );
@@ -404,48 +664,63 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
             h("h3", { style: { margin: 0 } }, "远程控制"),
             h("button", { className: "dshrc-btn sm", disabled: busy !== "", onClick: refresh }, "刷新状态"),
           ),
-          h("p", { className: "dshrc-hint" }, "在输入框上方点当前目标即可切换「本机 / 远程电脑」。这里保存连接组合；对话中 remote_connect 接入的机器会同步出现。密码保存在本机登记表，列表不显示。"),
+          h("p", { className: "dshrc-hint" }, "在对话输入框底部点目标即可切换「本机 / 远程电脑」。默认用 SSH 连接——目标机只需开启 OpenSSH 服务，无需装 agent；配置一次公钥后永久免密。目标机开机即可工作。"),
 
           h("div", { className: "dshrc-card" },
             h("div", { className: "dshrc-cardhead" },
-              h("span", { className: "dshrc-cardtitle" }, "添加 / 连接一台电脑"),
-              h("span", { className: "dshrc-kv" }, "无密码的电脑密码留空"),
+              h("span", { className: "dshrc-cardtitle" }, "添加一台电脑"),
+              h("span", { className: "dshrc-kv" }, "推荐 SSH，无需在目标机装任何东西"),
             ),
             h("div", { className: "dshrc-grid" },
-              field("名称", form.name, setField("name"), { placeholder: "如：办公室主机（可选）" }),
+              field("名称", form.name, setField("name"), { placeholder: "如：办公室主机（可选，默认显示目标机主机名）" }),
               field("IP 地址 *", form.host, setField("host"), { placeholder: "192.168.1.20" }),
-              field("用户名 *", form.username, setField("username"), { placeholder: "Administrator" }),
+              field("登录用户名 *", form.username, setField("username"), { placeholder: "root / Administrator / 你的账号" }),
               h("label", { className: "dshrc-field" },
-                h("span", { className: "dshrc-label" }, "密码（无密码可留空）"),
-                h("input", { className: "dshrc-input", type: "password", value: form.password, placeholder: "无密码留空", onChange: function (e) { setField("password")(e.target.value); } }),
-              ),
-              h("label", { className: "dshrc-field" },
-                h("span", { className: "dshrc-label" }, "操作系统"),
-                h("select", { className: "dshrc-input", value: form.os, onChange: function (e) { setField("os")(e.target.value); } },
-                  h("option", { value: "auto" }, "自动检测"),
-                  h("option", { value: "windows" }, "Windows"),
-                  h("option", { value: "linux" }, "Linux"),
+                h("span", { className: "dshrc-label" }, "传输方式"),
+                h("select", { className: "dshrc-input", value: form.transport, onChange: function (e) { setField("transport")(e.target.value); } },
+                  h("option", { value: "ssh" }, "SSH（无需 agent）"),
+                  h("option", { value: "agent" }, "Agent（HTTP 代理）"),
                 ),
               ),
-              h("label", { className: "dshrc-field" },
-                h("span", { className: "dshrc-label" }, "端口"),
-                h("input", { className: "dshrc-input", type: "number", value: form.port, onChange: function (e) { setField("port")(e.target.value); } }),
-              ),
+              form.transport === "ssh"
+                ? h("label", { className: "dshrc-field" },
+                    h("span", { className: "dshrc-label" }, "SSH 端口"),
+                    h("input", { className: "dshrc-input", type: "number", value: form.sshPort, placeholder: "22", onChange: function (e) { setField("sshPort")(e.target.value); } }),
+                  )
+                : h("label", { className: "dshrc-field" },
+                    h("span", { className: "dshrc-label" }, "Agent 端口"),
+                    h("input", { className: "dshrc-input", type: "number", value: form.port, placeholder: "5188", onChange: function (e) { setField("port")(e.target.value); } }),
+                  ),
             ),
             h("div", { className: "dshrc-grid" },
-              field("公网隧道地址（可选）", form.tunnelUrl, setField("tunnelUrl"), { className: "dshrc-field wide", placeholder: "https://xxx.trycloudflare.com（留空 = 直连/反向）" }),
-              field("本机工作区目录", form.localWorkspace, setField("localWorkspace"), { className: "dshrc-field wide", placeholder: "留空 = 登记表同目录 workspaces/<id>" }),
+              field("目标机工作区（绝对路径）", form.workspace, setField("workspace"), { className: "dshrc-field wide", placeholder: "如 /srv/projects 或 D:\\work —— 之后所有操作默认在这里执行" }),
             ),
+            form.transport === "agent"
+              ? h("div", null,
+                  h("div", { className: "dshrc-grid" },
+                    h("label", { className: "dshrc-field" },
+                      h("span", { className: "dshrc-label" }, "登录密码（部署 agent 用，可留空）"),
+                      h("input", { className: "dshrc-input", type: "password", value: form.password, placeholder: "无密码留空", onChange: function (e) { setField("password")(e.target.value); } }),
+                    ),
+                    field("公网隧道地址（可选）", form.tunnelUrl, setField("tunnelUrl"), { className: "dshrc-field wide", placeholder: "https://xxx.trycloudflare.com" }),
+                  ),
+                  h(TunnelHelp, { setMsg: setMsg }),
+                )
+              : null,
             h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" } },
               h("label", { className: "dshrc-check" },
                 h("input", { type: "checkbox", checked: form.autoConnect, onChange: function (e) { setField("autoConnect")(e.target.checked); } }),
                 "启动时自动探测状态",
               ),
               h("div", { className: "dshrc-actions" },
-                h("button", { className: "dshrc-btn", disabled: busy !== "", onClick: doSave }, "保存组合"),
-                h("button", { className: "dshrc-btn primary", disabled: busy !== "", onClick: doConnect }, "一步连接"),
+                h("button", { className: "dshrc-btn", disabled: busy !== "", onClick: doSave }, "保存"),
+                form.transport === "agent"
+                  ? h("button", { className: "dshrc-btn primary", disabled: busy !== "", onClick: doConnect }, "一步连接")
+                  : null,
               ),
             ),
+            h(DiscoverHelp, { setMsg: setMsg, onAdded: refresh }),
+            form.transport === "ssh" ? h(SshHelp, { setMsg: setMsg, machineId: savedId }) : null,
           ),
 
           msg

@@ -34,18 +34,24 @@ export interface RemoteMachine {
   id: string;
   /** Human-readable label. */
   name: string;
-  /** IP or hostname of the machine running dsh-remote-agent. */
+  /** IP or hostname of the target computer. */
   host: string;
-  /** Agent port (default 5188). */
+  /** Agent port (default 5188) — used only when an agent is present. */
   port: number;
-  /** Shared secret; must match the agent's --token. */
+  /** Shared secret; must match the agent's --token (agent mode only). */
   token: string;
   /** Optional SHA-256 of the token when the plaintext is not stored. */
   tokenSha256?: string;
-  /** Disabled machines are skipped by remote_machine_list probes. */
+  /** Disabled machines are skipped by probes and reject operations. */
   enabled: boolean;
   /** Remote workspace directory: relative exec/fs/upload/download paths resolve here. */
   workspace?: string;
+  /** SSH port (default 22). */
+  sshPort?: number;
+  /** Preferred transport: 'ssh' works with no agent; 'agent' needs the HTTP agent. */
+  transport?: "ssh" | "agent";
+  /** Optional per-machine SSH private key path; defaults to the plugin-managed key. */
+  sshIdentityFile?: string;
   /** Remote OS platform, learned from /health (win32/linux/darwin). */
   platform?: "win32" | "linux" | "darwin" | string;
   /** Ordered connection paths; first live path wins (client falls back). */
@@ -136,6 +142,9 @@ export function normalizeMachine(raw: unknown): RemoteMachine | null {
     tokenSha256: typeof record.tokenSha256 === "string" && record.tokenSha256 ? record.tokenSha256 : undefined,
     enabled: record.enabled !== false,
     workspace: typeof record.workspace === "string" && record.workspace ? record.workspace : undefined,
+    sshPort: typeof record.sshPort === "number" && Number.isInteger(record.sshPort) && record.sshPort > 0 && record.sshPort < 65536 ? record.sshPort : undefined,
+    transport: record.transport === "agent" || record.transport === "ssh" ? record.transport : undefined,
+    sshIdentityFile: typeof record.sshIdentityFile === "string" && record.sshIdentityFile ? record.sshIdentityFile : undefined,
     platform: typeof record.platform === "string" && record.platform ? record.platform : undefined,
     paths: paths && paths.length > 0 ? paths : undefined,
     tunnelUrl: normalizeTunnelUrl(typeof record.tunnelUrl === "string" ? record.tunnelUrl : undefined),
@@ -202,12 +211,45 @@ export function saveRegistry(file: string = defaultRegistryPath, registry: Machi
   }
 }
 
-/** Resolve the effective registry path from config.
- *  Default order: configured path → DSH_HOME/dsh-remote-control/machines.json
- *  (keeps all plugin data inside the harness data dir) → ~/.dsh-remote-control. */
+/**
+ * Resolve the effective registry path from config.
+ *
+ * Order: explicit config → DSH_HOME/dsh-remote-control/machines.json →
+ * ~/.dsh-remote-control/machines.json.
+ *
+ * IMPORTANT: the GUI process does not always inherit DSH_HOME (it can be
+ * launched from a different shell), so the same plugin could otherwise read
+ * two different files depending on how it was started. To keep every entry
+ * point on ONE file, when DSH_HOME is absent we also probe the conventional
+ * harness data locations and reuse whichever already has data — so machines
+ * saved through one route never appear "lost" through another.
+ */
 export function resolveRegistryPath(configured: string): string {
   if (configured && configured.trim()) return configured.trim();
   const dshHome = process.env.DSH_HOME?.trim();
   if (dshHome) return join(dshHome, "dsh-remote-control", "machines.json");
-  return defaultRegistryPath;
+
+  // No DSH_HOME: prefer an existing registry with actual machines so data is never
+  // split across two files. Candidates are the common harness homes on this OS.
+  const candidates: string[] = [defaultRegistryPath];
+  const home = homedir();
+  const homes = [
+    join(home, ".dsh"),
+    process.env.APPDATA ? join(process.env.APPDATA, "deepseek-harness") : "",
+    process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "deepseek-harness") : "",
+    "D:/deepseek harness/data",
+    "C:/deepseek harness/data",
+  ].filter(Boolean);
+  for (const h of homes) candidates.push(join(h, "dsh-remote-control", "machines.json"));
+
+  const nonEmpty = candidates.find((p) => {
+    try {
+      if (!existsSync(p)) return false;
+      const parsed = JSON.parse(readFileSync(p, "utf8")) as { machines?: unknown };
+      return Array.isArray(parsed.machines) && parsed.machines.length > 0;
+    } catch {
+      return false;
+    }
+  });
+  return nonEmpty ?? candidates[0];
 }

@@ -41,6 +41,14 @@ try {
   assert(tools.has('remote_machine_configure')); pass('configuration tool registered');
   await invoke('remote_machine_add', { id: 'a', host: '127.0.0.1', port, token: 'synthetic-a' });
   await invoke('remote_machine_add', { id: 'b', host: '127.0.0.1', port, token: 'synthetic-b', workspace: '/other' });
+  // Remote tools now require the machine to be the UI-selected target.
+  await tools.get('remote_machine_list').execute({ probe: false }, {}); // no-op warm-up
+  await new Promise((resolve) => {
+    const api = routes.find(r => r.path === '/dsh-remote-control/api');
+    const res = { writeHead() {}, end() { resolve(); } };
+    api.handler({ url: '/dsh-remote-control/api/activate', method: 'POST', socket: { remoteAddress: '127.0.0.1' }, headers: { host: 'localhost' },
+      on(event, cb) { if (event === 'data') cb(Buffer.from(JSON.stringify({ machine: 'a' }))); if (event === 'end') cb(); } }, res);
+  });
   await assert.rejects(invoke('remote_exec', { machine: 'a', command: 'pwd' }), /工作区/);
   assert.equal(captured.length, 0); pass('unset workspace blocks execution before network');
   await assert.rejects(invoke('remote_workspace', { machine: 'a', operation: 'set', path: '/repo/file.txt', create: false }), /不是目录/);
@@ -82,12 +90,16 @@ try {
   assert.equal((await callApi('/activate', 'POST', { machine: 'b' })).mode, 'remote'); pass('choosing a host keeps remote mode');
   await invoke('remote_exec', { command: 'pwd' });
   assert.equal(captured.at(-1).cwd, '/other'); pass('selected host becomes the default target');
+  // Hard rule: a machine that is NOT the selected target cannot be operated, even when named.
+  await assert.rejects(invoke('remote_exec', { machine: 'a', command: 'pwd' }), /不是当前选中的电脑/);
+  pass('explicit machine that is not the current target is refused');
+  await callApi('/activate', 'POST', { machine: 'a' });
   await invoke('remote_exec', { machine: 'a', command: 'pwd' });
-  assert.equal(captured.at(-1).cwd, '/newrepo'); pass('explicit machine still wins over selected host');
+  assert.equal(captured.at(-1).cwd, '/newrepo'); pass('after switching target to a, a is operable');
   state = await callApi('/state', 'GET');
-  assert.equal(state.active.id, 'a'); pass('using a host updates the current target');
+  assert.equal(state.active.id, 'a'); pass('current target follows the switch');
   assert.equal((await callApi('/activate', 'POST', { machine: '' })).active, null);
-  await assert.rejects(invoke('remote_exec', { command: 'pwd' }), /未指定机器/);
+  await assert.rejects(invoke('remote_exec', { command: 'pwd' }), /当前目标是「本机」|未指定机器/);
   pass('clearing target returns to this computer and unqualified calls refuse');
   const list = await invoke('remote_machine_list', { refresh: true });
   assert(list.includes('繁忙 2')); assert(list.includes('最后在线')); pass('catalog reports running jobs and last seen');
@@ -96,6 +108,7 @@ try {
   await invoke('remote_machine_list', { refresh: true }); assert(probes > previousProbes); pass('explicit refresh bypasses cache');
   const removal = await invoke('remote_machine_remove', { id: 'a' }); assert(removal.includes('未移除')); pass('online busy host removal refused');
   await invoke('remote_machine_configure', { machine: 'a', enabled: false });
+  await callApi('/activate', 'POST', { machine: 'a' });
   await assert.rejects(invoke('remote_exec', { machine: 'a', command: 'pwd' }), /停用/); pass('disabled machine rejects operations');
   await invoke('remote_machine_configure', { machine: 'a', enabled: true });
   await invoke('remote_machine_add', { id: 'a', host: '127.0.0.1', port });

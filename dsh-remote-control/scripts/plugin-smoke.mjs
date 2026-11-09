@@ -94,6 +94,13 @@ try {
 
   const added = await invoke("remote_machine_add", { id: machine, host: "127.0.0.1", port, token });
   check("machine add", added.includes("已登记"), "registered");
+  // Remote tools now require an explicitly selected target; mark this machine active.
+  {
+    const regFile = path.join(work, "machines.json");
+    const reg = JSON.parse(await readFile(regFile, "utf8"));
+    reg.mode = "remote"; reg.activeMachineId = machine;
+    await writeFile(regFile, JSON.stringify(reg, null, 2));
+  }
 
   const listed = await invoke("remote_machine_list", { probe: true });
   check("machine list probe", listed.includes("在线") && listed.includes(machine), "online");
@@ -195,7 +202,8 @@ try {
   check("registry persisted", registry.machines.length === 3, `${registry.machines.length} machines`);
   const comboMachines = registry.machines.filter((m) => m.id !== "smoke");
   check("combo credentials saved", comboMachines.length === 2 && comboMachines.every((m) => m.password === "secret" && m.username === "root"), "username/password stored in combo");
-  check("local workspace assigned", registry.machines.every((m) => m.localWorkspace && m.localWorkspace.includes("workspaces")), "per-machine local workspace");
+  // 「本机工作区」是已废弃字段：不再自动分配，也不应误导性地出现在登记表里。
+  check("no misleading local workspace", registry.machines.every((m) => !m.localWorkspace), "local workspace removed");
 
   // 无密码 Windows 路径：短命令（DSH-FETCH）+ 长命令（内置 base64）都要有。
   const winCmd = await invoke("remote_deploy_command", { machine: "smoke", os: "windows" });

@@ -1,46 +1,80 @@
 # dsh-remote-control
 
-让 DeepSeek Harness 通过一组 `remote_*` 工具连接**你自己的其它电脑**：在指定机器、指定目录执行命令、读写文件、跑后台任务。
+让 DeepSeek Harness 通过一组 `remote_*` 工具连接**你自己的其它电脑**：在指定机器、指定目录执行命令、读写文件。
 
-- **控制器**：运行在 DSH 内的本插件，保存机器登记表，提供工具与「设置 → 远程控制」面板，并在输入框上方显示当前目标。
-- **目标机**：运行零依赖单文件 agent（Node.js 18+），支持直连、认证反向隧道和公网 HTTP 隧道。
-- **当前版本**：插件 `0.7.0`，agent `1.5.0`。旧 agent 仍可用；忙碌状态、保持唤醒等新能力需要 1.5.0。
+- **传输方式：SSH（默认）** — 目标机只需开启 OpenSSH 服务，**不用安装任何东西**（无 agent）。配置一次公钥后永久免密，目标机开机即可工作。
+- 也可选 **agent** 模式（HTTP 单文件代理），支持后台长任务与公网隧道；但不再是必需。
+- **当前版本**：插件 `0.9.0`。
 
-> 本插件只做「远程控制你自己的电脑」，不提供云端算力，也不接管 DSH 新对话的执行主机选择。
+> 本插件只做「远程控制你自己的电脑」，不提供云端算力。
 
-## 快速开始
+## 快速开始（SSH，推荐）
 
-```bash
-# 1. 目标机启动 agent（随机密钥，换成你自己的）
-node agent/dsh-remote-agent.mjs --port 5188 --token <随机密钥> --workspace /srv/projects
+只需配置一次，之后只要目标机开机就能直接干活：
 
-# 2. 控制器登记
-remote_machine_add(id=build-pc, host=192.168.1.30, token=<同一随机密钥>)
+```text
+# 1. 登记目标机（默认 SSH；填登录用户名与目标机工作区）
+remote_machine_add(id=build-pc, host=192.168.1.30, username=root, workspace=/srv/projects)
 
-# 3. 选工作区（必须是已存在目录），然后执行
-remote_workspace(machine=build-pc, operation=set, path=/srv/projects)
+# 2. 按提示把本机公钥装到目标机（复制命令到目标机执行一次）
+remote_ssh_setup(machine=build-pc)          # 打印公钥 + 安装命令
+remote_ssh_setup(machine=build-pc, action=verify)   # 验证免密连通
+
+# 3. 之后随时在目标机工作区工作
 remote_exec(machine=build-pc, command="git status")
+remote_fs(machine=build-pc, operation=read, path="README.md")   # 相对路径 = 目标机工作区
 ```
 
-或让插件全自动接入（Windows + SMB）：`remote_connect(host=…, username=…, password=…)`。
+**前提**：目标机开启 SSH 服务。
+- Linux：`apt install openssh-server`（多数已自带），`systemctl enable --now ssh`
+- Windows：设置 → 可选功能 → 添加「OpenSSH 服务器」，`Start-Service sshd; Set-Service sshd -StartupType Automatic`
+
+在设置页「远程控制」面板里填 IP + 用户名 + 工作区点「保存」，面板会直接给出可复制的公钥安装命令和一个「验证 SSH 连通」按钮。
 
 ## 能做什么
 
 | 能力 | 工具 |
 |---|---|
-| 接入 / 部署 | `remote_connect`、`remote_connect_reverse`、`remote_deploy_command`、`remote_tunnel` |
-| 诊断 | `remote_diagnose` |
+| SSH 配置 | `remote_ssh_setup`（show 打印公钥/安装命令，verify 验证连通） |
 | 机器管理 | `remote_machine_list`、`remote_machine_add`、`remote_machine_configure`、`remote_machine_remove` |
 | 工作区 | `remote_workspace` |
-| 执行 | `remote_exec`、`remote_exec_bg`、`remote_job` |
+| 执行 | `remote_exec`（SSH 与 agent 都支持） |
 | 文件 | `remote_fs`、`remote_upload`、`remote_download` |
 | 信息 | `remote_sysinfo`、`remote_processes` |
+| agent 模式专用 | `remote_exec_bg` / `remote_job`（后台长任务）、`remote_tunnel`、`remote_connect*`、`remote_deploy_command`、`remote_diagnose` |
 
-完整用法见下文各节。输入框上方的目标条可一键切换「本机 / 远程电脑」。
+对话输入框底部的目标条可一键切换「本机 / 远程电脑」。
 
 ## 接入电脑
 
-### Windows 一步接入
+### SSH（无需 agent）
+
+```text
+remote_machine_add(id=build-pc, host=192.168.1.30, username=root, ssh_port=22, workspace=/srv/projects)
+remote_ssh_setup(machine=build-pc)                     # 复制公钥安装命令到目标机执行
+remote_ssh_setup(machine=build-pc, action=verify)      # 验证
+remote_workspace(machine=build-pc, operation=set, path=/srv/projects)   # 之后可随时改工作区
+```
+
+- **一次配置**：公钥装好后，后续所有操作都不再需要密码或人工介入。
+- **目标机开机即可用**：不依赖常驻进程；SSH 服务随系统启动。
+- **指定工作区**：`workspace` 是目标机上的绝对路径，所有命令默认在这里执行；`remote_workspace` 可随时修改。
+
+### agent 模式（可选）
+
+若需要**后台长任务**、或目标机不方便开 SSH，可继续用 agent：
+
+```bash
+# 目标机
+node agent/dsh-remote-agent.mjs --port 5188 --token <随机密钥> --workspace /srv/projects
+```
+
+```text
+remote_machine_add(id=build-pc, host=192.168.1.30, port=5188, token=<随机密钥>, transport=agent)
+remote_exec_bg(machine=build-pc, command="npm run build")
+```
+
+### Windows 一步接入（agent 模式，SMB 自动部署）
 
 目标机开启 SMB 管理共享，账号具有相应权限时，可以自动部署并创建默认工作区：
 
@@ -96,7 +130,19 @@ remote_connect_reverse(id=build-pc, host=192.168.1.30, controller_host=<目标�
 
 ### 公网 HTTP 隧道
 
-目标机运行 agent，再用 Cloudflare Tunnel、ngrok 或其他 HTTP 隧道转发 agent 端口。例如：
+目标机运行 agent，再用 Cloudflare Tunnel、ngrok 或其他 HTTP 隧道转发 agent 端口。
+
+**先装 cloudflared**（按目标机系统选一种，详见 [官方下载页](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)）：
+
+| 系统 | 安装命令 |
+|---|---|
+| Windows | `winget install --id Cloudflare.cloudflared -e`（或下载 `cloudflared-windows-amd64.exe` 改名入 PATH） |
+| macOS | `brew install cloudflared` |
+| Linux (Debian/Ubuntu) | 加官方 GPG + 源后 `sudo apt install cloudflared`（具体见下方或 README 面板） |
+
+> 目标机就是本机时，可直接点设置页里的「**为本机安装 cloudflared**」按钮一键安装；面板也会按你选的系统给出可复制的完整命令。
+
+然后启动隧道：
 
 ```bash
 cloudflared tunnel --url http://127.0.0.1:5188
@@ -189,7 +235,10 @@ agent 1.5.0 的 `/health` 上报忙碌任务数及保持唤醒状态。
 
 ## 设置页与安装
 
-设置页「远程控制」为卡片式布局：上方是「添加 / 连接一台电脑」表单（名称、IP、用户名、密码、系统、端口、隧道地址、本机工作区、自动探测），下方是「已保存的电脑」列表，卡片显示在线/繁忙/OS/隧道徽标、主机名、agent 版本、最后在线、默认执行目录与默认环境变量**名称**。面板和工具共用同一份登记表。
+设置页「远程控制」为卡片式布局：上方是「添加 / 连接一台电脑」表单（名称、IP、用户名、密码、系统、端口、公网隧道地址、自动探测），下方是「已保存的电脑」列表，卡片显示在线/繁忙/OS/隧道徽标、主机名、agent 版本、最后在线、默认执行目录与默认环境变量**名称**。面板和工具共用同一份登记表。
+
+> 远程命令只在**目标机**上执行：`remote_exec` / `remote_fs` / 上传下载的相对路径都基于**目标机的工作区**（用 `remote_workspace` 设置）。没有“本机工作区”这个概念。
+> 公网隧道：目标机执行 `cloudflared tunnel --url http://127.0.0.1:5188`，把输出的 `https://…` 填进表单的「公网隧道地址」，或 `remote_tunnel(machine, action=set, url=…)`。
 配置接口仅允许本机回环连接，拒绝公网 Host、转发来源和跨站变更；经公网 DSH 入口访问时请通过对话工具操作，连接配置在本机 GUI 完成。
 
 构建 host 与前端产物后用 `npm pack` 分发，确保运行依赖可解析，并在当前 profile 的 `dsh.profile.bundles` 加入 `@dsh-external/dsh-remote-control`。重启 DSH 后生效；前端 bundle 更新后刷新现有页面。

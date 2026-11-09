@@ -38,6 +38,9 @@ import {
   type RemoteMachine,
 } from "./registry.js";
 import { ReverseGateway } from "./reverse.js";
+import { AgentExecutor, SshExecutor, sshTargetOf, usesSsh, type Executor } from "./executor.js";
+import { defaultIdentityFile, ensureIdentity, publicKeyInstallCommand, sshProbe } from "./ssh.js";
+import { discoverHosts } from "./discovery.js";
 import { HostCatalog } from "./catalog.js";
 import { executionDefaults, isRemoteAbsolute, validateDefaultEnv } from "./execution.js";
 
@@ -114,6 +117,118 @@ function runLocal(file: string, args: string[], timeoutMs = 60_000): Promise<Loc
       });
     });
   });
+}
+
+interface CloudflaredGuide {
+  os: "win32" | "linux" | "darwin" | "auto";
+  title: string;
+  install: string[];
+  run: string[];
+  note: string;
+}
+
+/** 按操作系统给出 cloudflared 的安装与启动命令（用户复制到目标机执行）。 */
+function cloudflaredGuide(os: "win32" | "linux" | "darwin" | "auto"): CloudflaredGuide {
+  const port = 5188;
+  if (os === "win32") {
+    return {
+      os, title: "Windows",
+      install: [
+        "winget install --id Cloudflare.cloudflared -e",
+        "# 若没有 winget，任选其一：",
+        "#   1) 打开 https://github.com/cloudflare/cloudflared/releases/latest 下载 cloudflared-windows-amd64.exe",
+        "#   2) 把它重命名为 cloudflared.exe 放到一个目录（如 C:\\cloudflared）并加入 PATH",
+      ],
+      run: [`cloudflared tunnel --url http://127.0.0.1:${port}`],
+      note: "首次运行会输出一个 https://xxxx.trycloudflare.com 地址，复制它填到「公网隧道地址」。",
+    };
+  }
+  if (os === "darwin") {
+    return {
+      os, title: "macOS",
+      install: [
+        "brew install cloudflared",
+        "# 没有 Homebrew：https://github.com/cloudflare/cloudflared/releases/latest 下载 cloudflared-darwin-amd64.tgz 解压后放到 PATH",
+      ],
+      run: [`cloudflared tunnel --url http://127.0.0.1:${port}`],
+      note: "输出 https://xxxx.trycloudflare.com 地址后填到「公网隧道地址」。",
+    };
+  }
+  return {
+    os: os === "linux" ? "linux" : "auto",
+    title: "Linux",
+    install: [
+      "# Debian/Ubuntu（官方源）",
+      "sudo mkdir -p --mode=0755 /usr/share/keyrings",
+      "curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null",
+      'echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" | sudo tee /etc/apt/sources.list.d/cloudflared.list',
+      "sudo apt update && sudo apt install -y cloudflared",
+      "# 通用（任意发行版）：https://github.com/cloudflare/cloudflared/releases/latest 下载 cloudflared-linux-amd64，chmod +x 后放到 /usr/local/bin",
+    ],
+    run: [`cloudflared tunnel --url http://127.0.0.1:${port}`],
+    note: "输出 https://xxxx.trycloudflare.com 地址后填到「公网隧道地址」。若 agent 监听 127.0.0.1，cloudflared 需与 agent 在同一台机器。",
+  };
+}
+
+/** 本机是否已有 cloudflared（PATH 或常见目录）。 */
+async function cloudflaredStatus(): Promise<{ installed: boolean; path?: string; version?: string }> {
+  const candidates = process.platform === "win32"
+    ? ["cloudflared.exe", "cloudflared"]
+    : ["cloudflared"];
+  for (const bin of candidates) {
+    const r = await runLocal(bin, ["--version"], 8_000);
+    if (r.code === 0) return { installed: true, path: bin, version: r.stdout.trim().split(/\r?\n/)[0] };
+  }
+  const local = path.join(path.dirname(resolveRegistryPath("")), "cloudflared", process.platform === "win32" ? "cloudflared.exe" : "cloudflared");
+  if (existsSyncSafe(local)) {
+    const r = await runLocal(local, ["--version"], 8_000);
+    if (r.code === 0) return { installed: true, path: local, version: r.stdout.trim().split(/\r?\n/)[0] };
+  }
+  return { installed: false };
+}
+
+function existsSyncSafe(p: string): boolean {
+  try { return require("node:fs").existsSync(p); } catch { return false; }
+}
+
+/**
+ * 在本机安装 cloudflared（仅 Windows 走自动；其它平台返回可复制命令）。
+ * 非沙箱执行：winget 先行，失败则从官方 Release 下载 exe 到插件数据目录。
+ */
+async function installCloudflaredLocal(): Promise<{ ok: boolean; log: string[]; how?: "winget" | "download" | "manual"; guide?: CloudflaredGuide }> {
+  const log: string[] = [];
+  if (process.platform !== "win32") {
+    const guide = cloudflaredGuide(process.platform === "darwin" ? "darwin" : "linux");
+    return { ok: false, how: "manual", log: ["当前系统不支持一键安装，请按下列命令安装：", ...guide.install], guide };
+  }
+  // 1) 已有则直接返回
+  const existing = await cloudflaredStatus();
+  if (existing.installed) {
+    return { ok: true, how: "winget", log: [`已安装：${existing.path}（${existing.version ?? "版本未知"}）`] };
+  }
+  // 2) winget
+  log.push("尝试 winget 安装 Cloudflare.cloudflared …");
+  const wg = await runLocal("winget", ["install", "--id", "Cloudflare.cloudflared", "-e", "--accept-source-agreements", "--accept-package-agreements"], 180_000);
+  log.push(`winget exit ${wg.code}`);
+  if (wg.stdout.trim()) log.push(wg.stdout.trim().split(/\r?\n/).slice(-6).join("\n"));
+  if (wg.code === 0 && (await cloudflaredStatus()).installed) {
+    const st = await cloudflaredStatus();
+    return { ok: true, how: "winget", log: [...log, `安装成功：${st.path ?? "cloudflared"}`] };
+  }
+  // 3) 下载官方 exe 兜底
+  const dir = path.join(path.dirname(resolveRegistryPath("")), "cloudflared");
+  const target = path.join(dir, "cloudflared.exe");
+  log.push("winget 未成功，改为下载官方 release …");
+  const dl = await runLocal("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+    `$ErrorActionPreference='Stop'; New-Item -ItemType Directory -Force -Path '${dir}' | Out-Null; Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile '${target}'; exit 0`], 180_000);
+  if (dl.code === 0 && existsSyncSafe(target)) {
+    const r = await runLocal(target, ["--version"], 10_000);
+    log.push(`已下载到 ${target}；版本：${r.stdout.trim().split(/\r?\n/)[0] || "未知"}`);
+    return { ok: r.code === 0, how: "download", log };
+  }
+  log.push(dl.stderr.trim().slice(0, 400) || "下载失败");
+  const guide = cloudflaredGuide("win32");
+  return { ok: false, how: "manual", log, guide };
 }
 
 /** TCP 端口指纹：open / closed / timeout / closed(<errno>)。 */
@@ -530,34 +645,38 @@ function applyInternal(ctx: Context, config: Config): void {
     return readRegistry().machines.find((m) => m.id === id) ?? null;
   };
   /**
-   * Resolve the target machine for a tool call. An explicit id wins; otherwise the
-   * machine the UI marks as current. This is a convenience default for the same
-   * per-call targeting — it is not a sandbox or a session binding.
+   * Resolve the target machine for a tool call and ENFORCE the UI selection:
+   * - no active machine (mode = local) → remote tools refuse; the user must pick a computer.
+   * - an explicit `machine` id is allowed only when it IS the active machine; choosing another
+   *   machine from a tool call is refused, so "not selected ⇒ cannot control" holds.
    */
   const resolveTarget = (requested?: string): { id: string; machine: RemoteMachine } => {
-    const id = requested?.trim();
-    if (id) {
-      const machine = findMachine(id);
-      if (!machine) throw new Error(`机器 "${id}" 未登记。先用 remote_machine_list 查看，或 remote_connect 一键接入。`);
-      return { id, machine };
-    }
     const registry = readRegistry();
     const active = registry.activeMachineId ? registry.machines.find((m) => m.id === registry.activeMachineId) : undefined;
+    const id = requested?.trim();
     if (!active) {
-      throw new Error("未指定机器，且当前目标是本机。请传入 machine=<机器id>，或在输入框上方的目标指示器里选择远程电脑。");
+      if (id) {
+        throw new Error(`当前目标是「本机」，未选中远程电脑 "${id}"。请先在对话输入框底部把目标切换到该电脑，再操作。`);
+      }
+      throw new Error("当前目标是「本机」。请先在对话输入框底部选择一台远程电脑，再执行远程操作。");
+    }
+    if (id && id !== active.id) {
+      const other = findMachine(id);
+      if (!other) throw new Error(`机器 "${id}" 未登记。`);
+      throw new Error(`机器 "${id}" 不是当前选中的电脑（当前为 "${active.id}"）。请先在输入框底部把目标切换到 "${id}"。`);
+    }
+    if (active.enabled === false) {
+      throw new Error(`机器 "${active.id}" 已停用，无法操作。在设置页或 remote_machine_configure(machine="${active.id}", enabled=true) 启用后再试。`);
     }
     return { id: active.id, machine: active };
   };
-  const markActive = (id: string): void => {
-    const registry = readRegistry();
-    if (!registry.machines.some((m) => m.id === id) || registry.activeMachineId === id) return;
-    registry.activeMachineId = id;
-    save(registry);
-  };
-  const clientFor = (id?: string): RemoteClient => {
+  const clientFor = async (id?: string): Promise<Executor> => {
     const { machine } = resolveTarget(id);
-    markActive(machine.id);
-    return new RemoteClient(machine, config.defaultTimeoutMs);
+    if (usesSsh(machine)) {
+      const identity = (await ensureIdentity(registryPath)).privatePath;
+      return new SshExecutor(machine, identity, config.defaultTimeoutMs);
+    }
+    return new AgentExecutor(machine, config.defaultTimeoutMs);
   };
   const updateMachine = (id: string, mutate: (m: RemoteMachine) => void): RemoteMachine => {
     const registry = readRegistry();
@@ -576,9 +695,11 @@ function applyInternal(ctx: Context, config: Config): void {
       m.lastAgentVersion = health.version;
       m.lastHostname = health.hostname;
       m.platform = health.platform;
+      // 用户没自定义名字（名称等于 id 或空）时，用目标机上报的真实主机名做显示名。
+      if (health.hostname && (!m.name || m.name === m.id)) m.name = health.hostname;
       if (!m.workspace && health.workspace && isRemoteAbsolute(health.workspace)) m.workspace = health.workspace;
     });
-  });
+  }, 15_000, () => defaultIdentityFile(registryPath));
   const removeMachine = async (id: string, force = false): Promise<string> => {
     const machine = findMachine(id);
     if (!machine) return `机器 "${id}" 不存在，未做改动。`;
@@ -610,18 +731,12 @@ function applyInternal(ctx: Context, config: Config): void {
     return () => { disposed = true; clearTimeout(timer); };
   }, "dsh-remote-control: opted-in host discovery");
 
-  /** 每个目标机组合对应一个本机工作区目录（默认在登记表同级的 workspaces/<id>）。 */
-  const ensureLocalWorkspace = (machine: RemoteMachine): string => {
-    if (!machine.localWorkspace) {
-      machine.localWorkspace = path.join(path.dirname(registryPath), "workspaces", machine.id.replace(/[^A-Za-z0-9._-]/g, "-"));
-    }
-    try {
-      mkdirSync(machine.localWorkspace, { recursive: true });
-    } catch {
-      // 目录创建失败不阻断连接，仅保留路径。
-    }
-    return machine.localWorkspace;
-  };
+  /**
+   * 已废弃：旧版用来给每个组合分配一个「本机工作区目录」，但远程操作从不使用它
+   * （exec/fs/upload 等一律基于目标机的 workspace）。这里保留为 no-op 以兼容旧调用点，
+   * 不再创建目录，也不再写入字段，避免误导用户。
+   */
+  const ensureLocalWorkspace = (_machine: RemoteMachine): void => {};
 
   /** 面板用：剔除密码/token 明文。 */
   const sanitizeMachine = (m: RemoteMachine) => ({
@@ -629,6 +744,9 @@ function applyInternal(ctx: Context, config: Config): void {
     name: m.name,
     host: m.host,
     port: m.port,
+    transport: m.transport,
+    sshPort: m.sshPort,
+    username: m.username,
     platform: m.platform,
     osHint: m.osHint,
     workspace: m.workspace,
@@ -1145,28 +1263,37 @@ function applyInternal(ctx: Context, config: Config): void {
 
   ctx.effect(() => registerTool(defineTool({
     name: "remote_machine_add",
-    description: "登记一台已部署 dsh-remote-agent 的远程机器。未提供 token 时自动生成（结果展示一次全量）。",
+    description: "登记一台远程电脑。默认用 SSH（无需目标机装 agent，只需目标机开启 OpenSSH 服务）；也可用 agent 模式。",
     parameters: {
       id: { type: "string", required: true, description: "机器唯一标识，如 office-pc。" },
       host: { type: "string", required: true, description: "目标机 IP 或主机名，如 192.168.1.20。" },
-      port: { type: "integer", description: "agent 端口（默认 5188）。" },
-      token: { type: "string", description: "与 agent --token 相同的共享密钥；留空则自动生成。" },
-      token_sha256: { type: "string", description: "与 agent --token-sha256 相同的 64 位十六进制；与 token 二选一，该值本身也是可登录密钥。" },
-      name: { type: "string", description: "备注名（默认同 id）。" },
-      workspace: { type: "string", description: "可选：远程工作区绝对路径。" },
-      auto_connect: { type: "boolean", description: "启动时自动探活，默认关闭；不会自动部署或执行命令。" },
-      tunnel_url: { type: "string", description: "可选：公网隧道地址（如 https://xxx.trycloudflare.com），填了就走隧道，无需目标机入站端口。" },
+      username: { type: "string", description: "SSH 登录账号（SSH 模式必填）。" },
+      transport: { type: "string", enum: ["ssh", "agent"], description: "传输方式：ssh（默认，无需 agent）或 agent（HTTP 代理）。" },
+      ssh_port: { type: "integer", description: "SSH 端口（默认 22）。" },
+      workspace: { type: "string", description: "目标机工作区绝对路径：之后所有操作默认在这里执行。" },
+      port: { type: "integer", description: "仅 agent 模式：agent 端口（默认 5188）。" },
+      token: { type: "string", description: "仅 agent 模式：与 agent --token 相同的共享密钥。" },
+      token_sha256: { type: "string", description: "仅 agent 模式：64 位十六进制哈希凭据。" },
+      name: { type: "string", description: "显示名（默认同 id）。" },
+      auto_connect: { type: "boolean", description: "启动时自动探活，默认关闭，不会执行命令。" },
+      tunnel_url: { type: "string", description: "仅 agent 模式：公网隧道地址。" },
     },
     output: textOut(),
-    async execute(args: { id: string; host: string; port?: number; token?: string; token_sha256?: string; name?: string; workspace?: string; tunnel_url?: string; auto_connect?: boolean }) {
+    async execute(args: { id: string; host: string; username?: string; transport?: "ssh" | "agent"; ssh_port?: number; workspace?: string; port?: number; token?: string; token_sha256?: string; name?: string; tunnel_url?: string; auto_connect?: boolean }) {
       const id = args.id.trim();
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(id)) return `错误：id 只允许字母数字和 . _ -（收到 "${id}"）。`;
       const existing = findMachine(id);
+      const transport: "ssh" | "agent" = args.transport === "agent" ? "agent"
+        : args.transport === "ssh" ? "ssh"
+        : (existing?.transport ?? ((args.token?.trim() || args.token_sha256?.trim() || existing?.token || existing?.tokenSha256) ? "agent" : "ssh"));
+      if (transport === "ssh" && !(args.username?.trim() || existing?.username)) {
+        return "错误：SSH 模式需要 username（目标机登录账号），例如 remote_machine_add(id=pc1, host=1.2.3.4, username=root)。";
+      }
       if (args.token?.trim() && args.token_sha256?.trim()) throw new Error("token 与 token_sha256 不能同时提供。");
       const supplied = Boolean(args.token?.trim() || args.token_sha256?.trim());
-      const generated = !supplied && !existing?.token && !existing?.tokenSha256;
-      const token = args.token?.trim() || (args.token_sha256?.trim() ? "" : existing?.token || (generated ? newToken() : ""));
-      const tokenSha256 = args.token_sha256?.trim().toLowerCase() || (args.token?.trim() ? undefined : existing?.tokenSha256);
+      const generated = transport === "agent" && !supplied && !existing?.token && !existing?.tokenSha256;
+      const token = transport === "ssh" ? (existing?.token ?? "") : (args.token?.trim() || (args.token_sha256?.trim() ? "" : existing?.token || (generated ? newToken() : "")));
+      const tokenSha256 = transport === "ssh" ? undefined : (args.token_sha256?.trim().toLowerCase() || (args.token?.trim() ? undefined : existing?.tokenSha256));
       if (tokenSha256 && !/^[0-9a-f]{64}$/.test(tokenSha256)) return "错误：token_sha256 必须是 64 位十六进制。";
       const tunnelUrl = args.tunnel_url?.trim() ? normalizeTunnelUrl(args.tunnel_url) : undefined;
       if (args.tunnel_url?.trim() && !tunnelUrl) return "错误：tunnel_url 必须是 http(s):// 开头的地址，如 https://xxx.trycloudflare.com。";
@@ -1174,10 +1301,13 @@ function applyInternal(ctx: Context, config: Config): void {
       const machine: RemoteMachine = {
         ...existing,
         id,
+        transport,
         autoConnect: args.auto_connect ?? existing?.autoConnect ?? false,
         name: args.name?.trim() || existing?.name || id,
         host: args.host.trim(),
-        port: args.port && args.port > 0 && args.port < 65536 ? Math.floor(args.port) : 5188,
+        port: args.port && args.port > 0 && args.port < 65536 ? Math.floor(args.port) : (existing?.port ?? 5188),
+        sshPort: args.ssh_port && args.ssh_port > 0 && args.ssh_port < 65536 ? Math.floor(args.ssh_port) : existing?.sshPort,
+        username: args.username?.trim() || existing?.username,
         token,
         tokenSha256,
         enabled: true,
@@ -1193,6 +1323,20 @@ function applyInternal(ctx: Context, config: Config): void {
         : generated
           ? `共享 token（仅本次展示全量）：${token}`
           : `共享 token：${token.slice(0, 6)}…（已登记，不重复展示）`;
+      if (transport === "ssh") {
+        const idn = await ensureIdentity(registryPath);
+        const cmds = publicKeyInstallCommand(idn.publicKey);
+        return [
+          `已登记机器（SSH 传输，无需 agent）：${id} → ${machine.username}@${machine.host}:${machine.sshPort ?? 22}`,
+          ...(machine.workspace ? [`目标机工作区：${machine.workspace}`] : ["提示：用 remote_workspace(machine=" + id + ", operation=set, path=...) 指定目标机工作区"]),
+          "",
+          "下一步：把公钥装到目标机（只需一次，之后永久免密）。在目标机执行对应命令：",
+          `【Linux / macOS】\n${cmds.linux}`,
+          `【Windows（目标机需开启 OpenSSH Server）】\n${cmds.windows}`,
+          "",
+          `完成后运行 remote_ssh_setup(machine="${id}") 验证连通。`,
+        ].join("\n");
+      }
       return [
         `已登记机器：${id} → ${machine.host}:${machine.port}`,
         secretLine,
@@ -1202,6 +1346,79 @@ function applyInternal(ctx: Context, config: Config): void {
       ].join("\n");
     },
   })), "@dsh-external/dsh-remote-control: remote_machine_add");
+
+  // ── SSH 密钥引导与连通验证（无需 agent）──────────────────────────────────
+  ctx.effect(() => registerTool(defineTool({
+    name: "remote_ssh_setup",
+    description: "显示/验证 SSH 免密登录配置：打印目标机需执行的公钥安装命令，并验证能否连通。只需配置一次。",
+    parameters: {
+      machine: { type: "string", description: "机器 id；省略则使用当前选定的电脑。" },
+      action: { type: "string", enum: ["show", "verify"], description: "show=打印公钥与安装命令；verify=测试 SSH 连通。" },
+    },
+    output: textOut(),
+    async execute(args: { machine?: string; action?: "show" | "verify" }) {
+      const { machine } = resolveTarget(args.machine);
+      const idn = await ensureIdentity(registryPath);
+      const cmds = publicKeyInstallCommand(idn.publicKey);
+      if (args.action === "verify") {
+        const probe = await sshProbe(sshTargetOf(machine, idn.privatePath), idn.privatePath, 20_000);
+        return probe.ok
+          ? `SSH 连通正常：${machine.username}@${machine.host}:${machine.sshPort ?? 22}，可以直接在目标机工作。`
+          : `SSH 未连通：${probe.detail}`;
+      }
+      return [
+        `机器：${machine.id} (${machine.username ?? "未配置用户"}@${machine.host}:${machine.sshPort ?? 22})`,
+        `公钥：\n${idn.publicKey}`,
+        "",
+        "在目标机执行一次（之后永久免密）：",
+        `【Linux / macOS】\n${cmds.linux}`,
+        `【Windows OpenSSH Server】\n${cmds.windows}`,
+        "",
+        `验证：remote_ssh_setup(machine="${machine.id}", action=verify)`,
+      ].join("\n");
+    },
+  })), "@dsh-external/dsh-remote-control: remote_ssh_setup");
+
+  // ── 从本机 SSH 配置自动发现电脑（读取 ~/.ssh/config、known_hosts）────────
+  ctx.effect(() => registerTool(defineTool({
+    name: "remote_discover",
+    description: "列出本机 SSH 配置里已保存过的电脑（~/.ssh/config 与 known_hosts）。可选直接用 discover=true 批量登记进插件。",
+    parameters: {
+      discover: { type: "boolean", description: "true=把发现的电脑批量登记（已在登记表里的跳过）。默认只列出。" },
+    },
+    output: textOut(),
+    async execute(args: { discover?: boolean }) {
+      const { hosts, keys, sshDir } = discoverHosts();
+      if (hosts.length === 0) {
+        return `本机 ${sshDir} 下没有可发现的电脑。先用系统 ssh 连过一次目标机，或在面板里手动添加。`;
+      }
+      if (args.discover) {
+        const registry = readRegistry();
+        const existing = new Set(registry.machines.map((m) => `${m.host}:${m.sshPort ?? 22}`));
+        let added = 0;
+        const skipped: string[] = [];
+        for (const h of hosts) {
+          const key = `${h.host}:${h.port ?? 22}`;
+          if (existing.has(key)) { skipped.push(h.host); continue; }
+          const id = (h.alias || h.host).replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 64);
+          if (registry.machines.some((m) => m.id === id)) continue;
+          registry.machines.push({
+            id, name: h.alias || h.host, host: h.host, port: 5188, token: "", enabled: true,
+            transport: "ssh", sshPort: h.port, username: h.user,
+          });
+          added += 1;
+        }
+        save(registry);
+        return `已从本机 SSH 配置登记 ${added} 台电脑${skipped.length ? `，跳过已在列表的 ${skipped.length} 台` : ""}。\n接着用 remote_ssh_setup(machine=<id>) 查看公钥安装命令。`;
+      }
+      const lines = [`发现 ${hosts.length} 台（来源：${sshDir}；本机密钥：${keys.join(", ") || "无"}）：`];
+      for (const h of hosts) {
+        lines.push(`- ${h.host}${h.port ? `:${h.port}` : ""}${h.user ? `  user=${h.user}` : "  （用户名未知）"}${h.alias && h.alias !== h.host ? `  别名=${h.alias}` : ""}  [${h.source === "ssh-config" ? "ssh config" : "known_hosts"}]`);
+      }
+      lines.push("", "用 remote_discover(discover=true) 一键登记这些电脑。");
+      return lines.join("\n");
+    },
+  })), "@dsh-external/dsh-remote-control: remote_discover");
 
   // ── 公网隧道（可选路径）───────────────────────────────────────────────────
   ctx.effect(() => registerTool(defineTool({
@@ -1241,13 +1458,28 @@ function applyInternal(ctx: Context, config: Config): void {
           `连通性：${probe}${detail}`,
           online
             ? "现在 remote_exec / remote_fs 等会优先走隧道，失败自动回退直连/反向。"
-            : "隧道暂时不可用：确认目标机 cloudflared 正在运行、URL 未被刷新；稍后可 remote_tunnel(machine, action=show) 复测。",
+            : [
+                "隧道暂时不可用，按下面顺序排查：",
+                "  1) 目标机确认 agent 在跑：curl -i 127.0.0.1:5188/health（401 即正常）",
+                "  2) 目标机确认 cloudflared 在跑：cloudflared tunnel --url http://127.0.0.1:5188",
+                "  3) 复制它输出的 https://… 地址，重新 remote_tunnel(action=set, url=…)（临时地址重启会变）",
+                "  4) 仍不行用 remote_diagnose(host=该URL) 看 HTTP 层错误",
+              ].join("\n"),
           "隧道使用 90 秒同步执行、95 MiB 上传的保守阈值；服务商限制可能不同，长任务请用 remote_exec_bg。",
         ].join("\n");
       }
 
       const current = normalizeTunnelUrl(machine.tunnelUrl);
-      if (!current) return `机器 "${machine.id}" 未配置公网隧道（走 ${machine.host}:${machine.port}）。`;
+      if (!current) {
+        return [
+          `机器 "${machine.id}" 未配置公网隧道（当前走 ${machine.host}:${machine.port}）。`,
+          "要跨公网使用：",
+          "  1) 目标机安装 cloudflared 并执行：cloudflared tunnel --url http://127.0.0.1:5188",
+          "  2) 复制输出的 https://xxxx.trycloudflare.com 地址",
+          "  3) remote_tunnel(machine=\"" + machine.id + "\", action=set, url=https://xxxx.trycloudflare.com)",
+          "提示：临时隧道地址每次重启会变，长期使用建议 Cloudflare 固定域名隧道。",
+        ].join("\n");
+      }
       const probe = await probeAgentHttpUrl(current, 8_000);
       return [
         `机器 "${machine.id}" 的公网隧道：${current}`,
@@ -1283,7 +1515,9 @@ function applyInternal(ctx: Context, config: Config): void {
     },
     output: textOut(),
     async execute(args: { machine?: string; name?: string; enabled?: boolean; auto_connect?: boolean; default_cwd?: string; default_env?: unknown }) {
-      const { machine } = resolveTarget(args.machine);
+      // 配置类操作：按 id 直接查找，不要求先选中（只是改设置，不执行远程命令）。
+      const machine = args.machine ? findMachine(args.machine.trim()) : null;
+      if (!machine) throw new Error(`机器 "${args.machine ?? ""}" 未登记。`);
       if (args.name !== undefined && !args.name.trim()) throw new Error("显示名不能为空。");
       const env = args.default_env !== undefined ? validateDefaultEnv(args.default_env) : undefined;
       let cwd = machine.defaultCwd;
@@ -1320,7 +1554,7 @@ function applyInternal(ctx: Context, config: Config): void {
     },
     output: textOut(),
     async execute(args: { machine?: string; operation: "list" | "create" | "set"; path?: string; create?: boolean }) {
-      const client = clientFor(args.machine);
+      const client = await clientFor(args.machine);
       const machine = client.machine;
       const op = args.operation;
 
@@ -1380,7 +1614,7 @@ function applyInternal(ctx: Context, config: Config): void {
     },
     output: textOut(),
     async execute(args: { machine?: string; command: string; cwd?: string; timeout_ms?: number; env?: unknown }) {
-      const client = clientFor(args.machine);
+      const client = await clientFor(args.machine);
       const machine = client.machine;
       const { cwd, env } = executionDefaults(machine, args.cwd, normalizeEnv(args.env));
       const result = await client.exec(args.command, {
@@ -1389,11 +1623,10 @@ function applyInternal(ctx: Context, config: Config): void {
         timeoutMs: args.timeout_ms ?? config.defaultTimeoutMs,
       });
       const requested = args.timeout_ms ?? config.defaultTimeoutMs;
-      const effective = client.effectiveExecTimeout(requested);
-      const tunnelNote = machine.tunnelUrl && effective < requested
-        ? `提示：该机器配置了公网隧道，按插件保守策略，超时已从 ${requested}ms 降到 ${effective}ms；更长的命令请用 remote_exec_bg。\n`
+      const tunnelNote = machine.tunnelUrl
+        ? `提示：该机器配置了公网隧道，超时按插件保守策略处理；更长的命令请用 remote_exec_bg。\n`
         : "";
-      return tunnelNote + `远程工作目录：${cwd}\n` + formatExecResult(client, result, args.command);
+      return tunnelNote + `远程工作目录：${cwd}\n` + formatExecResult(machine, result, args.command);
     },
   })), "@dsh-external/dsh-remote-control: remote_exec");
 
@@ -1410,9 +1643,12 @@ function applyInternal(ctx: Context, config: Config): void {
     },
     output: textOut(),
     async execute(args: { machine?: string; command: string; cwd?: string; timeout_ms?: number; env?: unknown }) {
-      const client = clientFor(args.machine);
+      const client = await clientFor(args.machine);
       const machine = client.machine;
       const { cwd, env } = executionDefaults(machine, args.cwd, normalizeEnv(args.env));
+      if (!client.startJob) {
+        return `机器 "${machine.id}" 使用 SSH 传输，不支持后台任务。请改用 remote_exec 直接执行；需要长时间运行时，可在命令里自行加 nohup / 重定向日志，例如：\n  remote_exec(machine="${machine.id}", command="nohup 你的命令 > /tmp/task.log 2>&1 &")`;
+      }
       const job = await client.startJob(args.command, {
         cwd,
         env,
@@ -1440,7 +1676,10 @@ function applyInternal(ctx: Context, config: Config): void {
     },
     output: textOut(),
     async execute(args: { machine?: string; action: "list" | "status" | "output" | "kill"; job_id?: string; tail_chars?: number }) {
-      const client = clientFor(args.machine);
+      const client = await clientFor(args.machine);
+      if (!client.listJobs || !client.killJob || !client.jobOutput) {
+        return `机器 "${client.machine.id}" 使用 SSH 传输，没有后台任务概念。请直接用 remote_exec 执行。`;
+      }
       if (args.action === "list") {
         const jobs = await client.listJobs();
         if (jobs.length === 0) return `机器 ${client.machine.id} 上没有后台任务。用 remote_exec_bg 启动。`;
@@ -1504,7 +1743,7 @@ function applyInternal(ctx: Context, config: Config): void {
       machine?: string; operation: string; path: string; content?: string;
       new_path?: string; encoding?: "utf8" | "base64"; recursive?: boolean;
     }) {
-      const client = clientFor(args.machine);
+      const client = await clientFor(args.machine);
       const machine = client.machine;
       const op = args.operation;
       const payload: Record<string, unknown> = {
@@ -1534,10 +1773,10 @@ function applyInternal(ctx: Context, config: Config): void {
     },
     output: textOut(),
     async execute(args: { machine?: string; local_path: string; remote_path: string; timeout_ms?: number }) {
-      const client = clientFor(args.machine);
+      const client = await clientFor(args.machine);
       const machine = client.machine;
       const remotePath = resolveRemotePath(machine, args.remote_path, "上传");
-      const result = await client.upload(args.local_path, remotePath, { timeoutMs: args.timeout_ms ?? config.defaultTimeoutMs });
+      const result = await client.upload(args.local_path, remotePath);
       return `已上传 ${args.local_path} → ${client.machine.id}:${remotePath}（${result.sizeBytes} 字节）`;
     },
   })), "@dsh-external/dsh-remote-control: remote_upload");
@@ -1553,11 +1792,11 @@ function applyInternal(ctx: Context, config: Config): void {
     },
     output: textOut(),
     async execute(args: { machine?: string; remote_path: string; local_path: string; timeout_ms?: number }) {
-      const client = clientFor(args.machine);
+      const client = await clientFor(args.machine);
       const machine = client.machine;
       const remotePath = resolveRemotePath(machine, args.remote_path, "下载");
-      const result = await client.download(remotePath, args.local_path, { timeoutMs: args.timeout_ms ?? config.defaultTimeoutMs });
-      return `已下载 ${client.machine.id}:${remotePath} → ${result.localPath}（${result.sizeBytes} 字节）`;
+      const result = await client.download(remotePath, args.local_path);
+      return `已下载 ${client.machine.id}:${remotePath} → ${result.localPath ?? args.local_path}（${result.sizeBytes} 字节）`;
     },
   })), "@dsh-external/dsh-remote-control: remote_download");
 
@@ -1570,9 +1809,9 @@ function applyInternal(ctx: Context, config: Config): void {
     },
     output: textOut(),
     async execute(args: { machine?: string }) {
-      const client = clientFor(args.machine);
+      const client = await clientFor(args.machine);
       const info = await client.sysinfo();
-      return formatSysinfo(client, info);
+      return formatSysinfo(client.machine, info);
     },
   })), "@dsh-external/dsh-remote-control: remote_sysinfo");
 
@@ -1586,7 +1825,7 @@ function applyInternal(ctx: Context, config: Config): void {
     },
     output: textOut(),
     async execute(args: { machine?: string; action: "list" | "kill"; pid?: number }) {
-      const client = clientFor(args.machine);
+      const client = await clientFor(args.machine);
       if (args.action === "kill") {
         if (!Number.isInteger(args.pid) || (args.pid as number) <= 0) return "错误：kill 需要正整数 pid。";
         const result = await client.killProcess(args.pid as number);
@@ -1595,7 +1834,7 @@ function applyInternal(ctx: Context, config: Config): void {
       const processes = await client.processes();
       const lines = [`远程进程（${processes.length} 个，pid/name/cmd）：`];
       for (const p of processes.slice(0, 200)) {
-        lines.push(`- ${p.pid}${p.ppid !== undefined ? ` (ppid ${p.ppid})` : ""}  ${p.name}${p.cmd ? `  ${p.cmd.slice(0, 160)}` : ""}`);
+        lines.push(`- ${p.pid}  ${p.name}${p.cmd ? `  ${p.cmd.slice(0, 160)}` : ""}`);
       }
       if (processes.length > 200) lines.push(`… 仅显示前 200 个，共 ${processes.length} 个。`);
       return lines.join("\n");
@@ -1716,6 +1955,23 @@ function applyInternal(ctx: Context, config: Config): void {
             return send(res, 200, { ok: true, machines, registryPath });
           }
 
+          // ── cloudflared 安装引导 / 本机一键安装 ────────────────────────────
+          if (method === "GET" && pathname === "/cloudflared/guide") {
+            const os = url.searchParams.get("os") === "linux" ? "linux"
+              : url.searchParams.get("os") === "darwin" ? "darwin"
+              : url.searchParams.get("os") === "win32" ? "win32" : "auto";
+            return send(res, 200, { ok: true, guide: cloudflaredGuide(os) });
+          }
+
+          if (method === "POST" && pathname === "/cloudflared/install") {
+            const result = await installCloudflaredLocal();
+            return send(res, 200, result);
+          }
+
+          if (method === "GET" && pathname === "/cloudflared/status") {
+            return send(res, 200, { ok: true, ...(await cloudflaredStatus()) });
+          }
+
           if (method === "POST" && pathname === "/save") {
             const body = JSON.parse(await readHttpBody(req) || "{}") as Record<string, unknown>;
             const id = String(body.id ?? "").trim() || `pc-${String(body.host ?? "").replace(/[^A-Za-z0-9._-]/g, "-")}`.slice(0, 64);
@@ -1727,26 +1983,82 @@ function applyInternal(ctx: Context, config: Config): void {
             if (!username) return send(res, 400, { ok: false, error: "username 必填" });
             const osHint = body.os === "windows" || body.os === "linux" ? body.os : "auto";
             const existing = findMachine(id);
+            const transportIn = body.transport === "agent" ? "agent" : body.transport === "ssh" ? "ssh" : undefined;
+            const transport: "ssh" | "agent" = transportIn ?? existing?.transport ?? "ssh";
             const tunnelUrlRaw = String(body.tunnelUrl ?? "").trim();
             const tunnelUrl = tunnelUrlRaw ? normalizeTunnelUrl(tunnelUrlRaw) : existing?.tunnelUrl;
             if (tunnelUrlRaw && !tunnelUrl) return send(res, 400, { ok: false, error: "tunnelUrl 必须是 http(s):// 地址，如 https://xxx.trycloudflare.com" });
+            const workspace = String(body.workspace ?? "").trim() || existing?.workspace;
+            const sshPortRaw = typeof body.sshPort === "number" ? Math.floor(body.sshPort) : Number(String(body.sshPort ?? "").trim() || NaN);
             const registry = readRegistry();
             const machine: RemoteMachine = {
-              ...(existing ?? {
-                id, name: id, host, port: 5188, token: newToken(), enabled: true, tokenCreatedAt: Date.now(),
-              }),
+              ...(existing ?? { id, name: id, host, port: 5188, token: "", enabled: true, tokenCreatedAt: Date.now() }),
               id, name: String(body.name ?? "").trim() || existing?.name || id,
               host,
+              transport,
+              sshPort: Number.isInteger(sshPortRaw) && sshPortRaw > 0 && sshPortRaw < 65536 ? sshPortRaw : existing?.sshPort,
               port: typeof body.port === "number" && body.port > 0 && body.port < 65536 ? Math.floor(body.port) : (existing?.port ?? 5188),
+              token: transport === "ssh" ? (existing?.token ?? "") : (existing?.token || newToken()),
               username, password, osHint,
+              workspace,
               tunnelUrl,
               autoConnect: typeof body.autoConnect === "boolean" ? body.autoConnect : existing?.autoConnect ?? false,
-              localWorkspace: String(body.localWorkspace ?? "").trim() || existing?.localWorkspace || undefined,
+              localWorkspace: undefined,
             };
-            ensureLocalWorkspace(machine);
             registry.machines = [...registry.machines.filter((m) => m.id !== id), machine];
             save(registry);
             return send(res, 200, { ok: true, machine: sanitizeMachine(machine) });
+          }
+
+          // SSH：公钥与安装命令（一次配置），以及连通性验证
+          if (method === "GET" && pathname === "/discover") {
+            const { hosts, keys, sshDir } = discoverHosts();
+            return send(res, 200, { ok: true, hosts, keys, sshDir });
+          }
+          if (method === "POST" && pathname === "/discover/add") {
+            const body = JSON.parse(await readHttpBody(req) || "{}") as Record<string, unknown>;
+            const host = String(body.host ?? "").trim();
+            if (!host) return send(res, 400, { ok: false, error: "缺少 host" });
+            const registry = readRegistry();
+            if (registry.machines.some((m) => m.host === host)) {
+              return send(res, 200, { ok: true, skipped: true });
+            }
+            const id = (String(body.alias ?? "") || host).replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 64);
+            registry.machines.push({
+              id, name: String(body.alias ?? "") || host, host, port: 5188, token: "", enabled: true,
+              transport: "ssh", sshPort: typeof body.port === "number" ? body.port : undefined,
+              username: typeof body.user === "string" && body.user ? body.user : undefined,
+            });
+            save(registry);
+            return send(res, 200, { ok: true, id });
+          }
+
+          if (method === "GET" && pathname === "/ssh/guide") {
+            const idn = await ensureIdentity(registryPath);
+            return send(res, 200, { ok: true, publicKey: idn.publicKey, commands: publicKeyInstallCommand(idn.publicKey) });
+          }
+          if (method === "POST" && pathname === "/ssh/verify") {
+            const body = JSON.parse(await readHttpBody(req) || "{}") as Record<string, unknown>;
+            const requestedId = String(body.id ?? "").trim();
+            // Older callers (and the form before saving) may omit id: fall back to the active machine.
+            let machine = requestedId ? findMachine(requestedId) : null;
+            if (!machine) {
+              const reg = readRegistry();
+              machine = reg.machines.find((m) => m.id === reg.activeMachineId)
+                ?? (reg.machines.length === 1 ? reg.machines[0] : null);
+            }
+            if (!machine) return send(res, 400, { ok: false, error: "未指定机器：请先在列表里保存一台电脑，或传 id。" });
+            const idn = await ensureIdentity(registryPath);
+            // 20s ± one retry: first connection also writes the host key, which can be slow.
+            let probe = await sshProbe(sshTargetOf(machine, idn.privatePath), idn.privatePath, 20_000);
+            if (!probe.ok && /超时|timeout/i.test(probe.detail)) {
+              probe = await sshProbe(sshTargetOf(machine, idn.privatePath), idn.privatePath, 20_000);
+            }
+            return send(res, 200, {
+              ok: true, connected: probe.ok, detail: probe.detail,
+              verifyFile: probe.verifyFile, verifyTime: probe.verifyTime,
+              machine: machine.id, commands: publicKeyInstallCommand(idn.publicKey),
+            });
           }
 
           if (method === "POST" && pathname === "/connect") {
@@ -1841,10 +2153,10 @@ function formatJobStatus(job: JobInfo): string {
   return `${icon} ${state}  耗时 ${seconds}s  ${buffers}`;
 }
 
-function formatExecResult(client: RemoteClient, r: ExecResult, fallbackCommand?: string): string {
+function formatExecResult(machine: RemoteMachine, r: ExecResult, fallbackCommand?: string): string {
   const command = r.command || fallbackCommand || "(未知命令)";
   const head = [
-    `机器：${client.machine.name} (${client.machine.host}:${client.machine.port})`,
+    `机器：${machine.name} (${machine.host}${machine.transport === "ssh" ? ":ssh" : `:${machine.port}`})`,
     `命令：${command.length > 800 ? command.slice(0, 800) + "…(截断)" : command}`,
     `退出码：${r.exitCode ?? "无"}${r.signal ? `  信号：${r.signal}` : ""}  耗时：${r.durationMs}ms${r.timedOut ? "  [已超时]" : ""}${r.truncated ? "  [输出已截断]" : ""}`,
   ];
@@ -1854,14 +2166,14 @@ function formatExecResult(client: RemoteClient, r: ExecResult, fallbackCommand?:
   return parts.join("\n");
 }
 
-function formatSysinfo(client: RemoteClient, info: SysInfo): string {
+function formatSysinfo(machine: RemoteMachine, info: SysInfo): string {
   const gb = (n: number) => (n / 1024 ** 3).toFixed(1) + " GB";
   return [
-    `机器：${client.machine.name} (${client.machine.host}:${client.machine.port})`,
+    `机器：${machine.name} (${machine.host}${machine.transport === "ssh" ? ":ssh" : `:${machine.port}`})`,
     `主机名：${info.hostname}  用户：${info.user}`,
-    `系统：${info.osType} ${info.release} (${info.platform}/${info.arch})  Node ${info.nodeVersion}  agent v${info.agentVersion}`,
-    `CPU：${info.cpus.model} × ${info.cpus.count}`,
-    `内存：${gb(info.memFreeBytes)} 可用 / ${gb(info.memTotalBytes)} 总量`,
-    `负载：${info.loadAvg.join(" / ")}  运行时长：${Math.floor(info.uptimeSec / 86400)}天${Math.floor((info.uptimeSec % 86400) / 3600)}小时`,
-  ].join("\n");
+    `系统：${info.osType} ${info.release} (${info.platform}/${info.arch})${info.agentVersion === "ssh" ? "  [SSH 传输]" : `  Node ${info.nodeVersion}  agent v${info.agentVersion}`}`,
+    info.cpus && info.cpus.count > 0 ? `CPU：${info.cpus.model} × ${info.cpus.count}` : null,
+    info.memTotalBytes > 0 ? `内存：${gb(info.memFreeBytes)} 可用 / ${gb(info.memTotalBytes)} 总量` : null,
+    info.loadAvg.length > 0 ? `负载：${info.loadAvg.join(" / ")}  运行时长：${Math.floor(info.uptimeSec / 86400)}天${Math.floor((info.uptimeSec % 86400) / 3600)}小时` : null,
+  ].filter(Boolean).join("\n");
 }

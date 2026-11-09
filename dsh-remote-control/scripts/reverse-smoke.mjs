@@ -58,6 +58,12 @@ try {
   check("connect_reverse flow", out.includes("反向接入已准备就绪") && out.includes("--reverse"), "tool output");
 
   const registry = JSON.parse(await readFile(path.join(work, "machines.json"), "utf8"));
+  // Remote tools now require an explicitly selected target; mark this machine active.
+  {
+    const regFile = path.join(work, "machines.json");
+    registry.mode = "remote"; registry.activeMachineId = "rev";
+    await writeFile(regFile, JSON.stringify(registry, null, 2));
+  }
   const machine = registry.machines[0];
   const token = machine.token;
   const reversePath = machine.paths.find((p) => p.kind === "reverse");

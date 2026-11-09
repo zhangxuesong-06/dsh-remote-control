@@ -1,4 +1,4 @@
-import assert from 'node:assert/strict';
+﻿import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -22,10 +22,12 @@ try {
   assert.deepEqual(errors, []);
   assert(tools.has('remote_machine_configure'));
   assert(tools.has('remote_tunnel'));
-  assert.equal(tools.size, 18);
+  assert.equal(tools.size, 20);
   assert(routes.some(r => r.path === '/dsh-remote-control/api'));
   console.log(`Installed plugin ${pkg.version}: ${tools.size} tools and settings route verified; user registry untouched.`);
 } finally {
   for (const dispose of disposers.reverse()) await dispose();
   await rm(work, { recursive: true, force: true });
 }
+
+
