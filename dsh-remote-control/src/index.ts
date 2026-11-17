@@ -19,7 +19,7 @@
  */
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -41,6 +41,12 @@ import { ReverseGateway } from "./reverse.js";
 import { AgentExecutor, SshExecutor, sshTargetOf, usesSsh, type Executor } from "./executor.js";
 import { defaultIdentityFile, ensureIdentity, publicKeyInstallCommand, sshProbe } from "./ssh.js";
 import { discoverHosts } from "./discovery.js";
+import { installCloudflared, QuickTunnel, resolveCloudflared } from "./cloudflared.js";
+import { pickFreePort, TunnelForwarder } from "./forwarder.js";
+import {
+  applyStaged, checkForUpdate, installRootFromModule, isNewer, loadUpdateState, saveUpdateState,
+  stageUpdate,
+} from "./updater.js";
 import { HostCatalog } from "./catalog.js";
 import { executionDefaults, isRemoteAbsolute, validateDefaultEnv } from "./execution.js";
 
@@ -188,7 +194,7 @@ async function cloudflaredStatus(): Promise<{ installed: boolean; path?: string;
 }
 
 function existsSyncSafe(p: string): boolean {
-  try { return require("node:fs").existsSync(p); } catch { return false; }
+  try { return existsSync(p); } catch { return false; }
 }
 
 /**
@@ -611,6 +617,51 @@ export function apply(ctx: Context, rawConfig: Config): void {
 
 function applyInternal(ctx: Context, config: Config): void {
   const registryPath = resolveRegistryPath(config.registryFile);
+  // ── 自更新：判定自身安装目录与当前版本 ──────────────────────────────────────
+  const installRoot = installRootFromModule(import.meta.url);
+  const updateStatePath = path.join(path.dirname(registryPath), "update-state.json");
+  const readInstalledVersion = (): string => {
+    try {
+      return (JSON.parse(readFileSync(path.join(installRoot, "package.json"), "utf8")) as { version?: string }).version ?? "0.0.0";
+    } catch { return "0.0.0"; }
+  };
+
+  // 后台自动检查：启动后延迟一次，之后按间隔轮询。只检查/记录，是否自动安装由用户决定。
+  ctx.effect(() => {
+    let timer: NodeJS.Timeout | null = null;
+    let disposed = false;
+    const schedule = (ms: number) => {
+      timer = setTimeout(run, ms);
+      timer.unref?.();
+    };
+    const run = async () => {
+      if (disposed) return;
+      let st;
+      try { st = loadUpdateState(updateStatePath); } catch { return schedule(6 * 60 * 60 * 1000); }
+      if (!st.autoCheck) return schedule(60 * 60 * 1000);
+      const due = !st.lastCheckAt || Date.now() - st.lastCheckAt >= st.intervalHours * 3_600_000;
+      if (due) {
+        try {
+          const current = readInstalledVersion();
+          const r = await checkForUpdate(current, st.manifestUrl, 20_000);
+          st.lastCheckAt = Date.now();
+          st.lastCheckVersion = r.latest;
+          st.lastError = r.ok ? undefined : r.error;
+          saveUpdateState(updateStatePath, st);
+          if (r.ok && r.updateAvailable && st.autoInstall && r.manifest) {
+            const staged = await stageUpdate(r.manifest, path.join(path.dirname(registryPath), "update-cache"));
+            if (staged.ok && staged.dir) {
+              const applied = applyStaged(staged.dir, installRoot, path.join(path.dirname(registryPath), "update-backups"));
+              if (applied.ok) { st.pendingRestart = r.manifest.version; saveUpdateState(updateStatePath, st); }
+            }
+          }
+        } catch { /* 网络问题下次再试 */ }
+      }
+      schedule(6 * 60 * 60 * 1000);
+    };
+    schedule(30_000);
+    return () => { disposed = true; if (timer) clearTimeout(timer); };
+  }, "dsh-remote-control: auto update check");
   // 兜底默认值：测试环境/未走 schema 默认值加载时也不至于拿 undefined。
   const cfg = {
     defaultTimeoutMs: config.defaultTimeoutMs ?? 120_000,
@@ -670,9 +721,50 @@ function applyInternal(ctx: Context, config: Config): void {
     }
     return { id: active.id, machine: active };
   };
+  // ── 托管隧道转发器：插件自己跑 cloudflared access tcp，用户无需另开终端 ──────
+  const forwarders = new Map<string, TunnelForwarder>();
+
+  const forwarderBinPath = async (): Promise<string> => {
+    const found = await resolveCloudflared(cloudflaredBaseDir());
+    if (found) return found.path;
+    const inst = await installCloudflared(cloudflaredBaseDir());
+    if (!inst.ok || !inst.path) throw new Error(`自动下载 cloudflared 失败：${inst.log.join("；") || "未知原因"}`);
+    return inst.path;
+  };
+
+  /** Ensure the managed forwarder for a tunnel machine is running and its port is recorded. */
+  const ensureForwarder = async (machine: RemoteMachine): Promise<TunnelForwarder> => {
+    const hostname = machine.tunnelForwardHost;
+    if (!hostname) throw new Error(`机器 "${machine.id}" 未配置要转发的 Cloudflare 域名。`);
+    const existing = forwarders.get(machine.id);
+    if (existing && existing.state.running && existing.state.hostname === hostname) return existing;
+    existing?.stop();
+
+    const bin = await forwarderBinPath();
+    const port = await pickFreePort();
+    const fwd = new TunnelForwarder(bin, hostname, port);
+    forwarders.set(machine.id, fwd);
+    const st = await fwd.start();
+    if (!st.running) {
+      throw new Error(`无法建立到 ${hostname} 的隧道转发：${st.error || "未知原因"}`);
+    }
+    // Point the machine at the local forwarded port so SSH uses it.
+    updateMachine(machine.id, (m) => {
+      m.transport = "tunnel";
+      m.tunnelHost = "127.0.0.1";
+      m.tunnelPort = st.localPort;
+    });
+    return fwd;
+  };
+
   const clientFor = async (id?: string): Promise<Executor> => {
-    const { machine } = resolveTarget(id);
+    let { machine } = resolveTarget(id);
     if (usesSsh(machine)) {
+      // Tunnel machines may rely on a plugin-managed forwarder; make sure it is up first.
+      if (machine.transport === "tunnel" && machine.tunnelForwardHost) {
+        await ensureForwarder(machine);
+        machine = findMachine(machine.id) ?? machine;
+      }
       const identity = (await ensureIdentity(registryPath)).privatePath;
       return new SshExecutor(machine, identity, config.defaultTimeoutMs);
     }
@@ -686,6 +778,10 @@ function applyInternal(ctx: Context, config: Config): void {
     save(registry);
     return machine;
   };
+
+  // Managed cloudflared data dir (alongside the registry) and the single active quick tunnel.
+  const cloudflaredBaseDir = (): string => path.dirname(registryPath);
+  let quickTunnel: QuickTunnel | null = null;
 
   const catalog = new HostCatalog((original, health) => {
     const current = findMachine(original.id);
@@ -746,6 +842,9 @@ function applyInternal(ctx: Context, config: Config): void {
     port: m.port,
     transport: m.transport,
     sshPort: m.sshPort,
+    tunnelHost: m.tunnelHost,
+    tunnelForwardHost: m.tunnelForwardHost,
+    tunnelPort: m.tunnelPort,
     username: m.username,
     platform: m.platform,
     osHint: m.osHint,
@@ -1270,6 +1369,8 @@ function applyInternal(ctx: Context, config: Config): void {
       username: { type: "string", description: "SSH 登录账号（SSH 模式必填）。" },
       transport: { type: "string", enum: ["ssh", "agent"], description: "传输方式：ssh（默认，无需 agent）或 agent（HTTP 代理）。" },
       ssh_port: { type: "integer", description: "SSH 端口（默认 22）。" },
+      tunnel_host: { type: "string", description: "仅 tunnel 模式：公网中继主机（域名或 IP），其端口转发到目标机 SSH。" },
+      tunnel_port: { type: "integer", description: "仅 tunnel 模式：公网中继端口（默认 22）。" },
       workspace: { type: "string", description: "目标机工作区绝对路径：之后所有操作默认在这里执行。" },
       port: { type: "integer", description: "仅 agent 模式：agent 端口（默认 5188）。" },
       token: { type: "string", description: "仅 agent 模式：与 agent --token 相同的共享密钥。" },
@@ -1279,21 +1380,27 @@ function applyInternal(ctx: Context, config: Config): void {
       tunnel_url: { type: "string", description: "仅 agent 模式：公网隧道地址。" },
     },
     output: textOut(),
-    async execute(args: { id: string; host: string; username?: string; transport?: "ssh" | "agent"; ssh_port?: number; workspace?: string; port?: number; token?: string; token_sha256?: string; name?: string; tunnel_url?: string; auto_connect?: boolean }) {
+    async execute(args: { id: string; host: string; username?: string; transport?: "ssh" | "agent" | "tunnel"; ssh_port?: number; tunnel_host?: string; tunnel_port?: number; workspace?: string; port?: number; token?: string; token_sha256?: string; name?: string; tunnel_url?: string; auto_connect?: boolean }) {
       const id = args.id.trim();
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(id)) return `错误：id 只允许字母数字和 . _ -（收到 "${id}"）。`;
       const existing = findMachine(id);
-      const transport: "ssh" | "agent" = args.transport === "agent" ? "agent"
+      const transport: "ssh" | "agent" | "tunnel" = args.transport === "agent" ? "agent"
         : args.transport === "ssh" ? "ssh"
+        : args.transport === "tunnel" ? "tunnel"
         : (existing?.transport ?? ((args.token?.trim() || args.token_sha256?.trim() || existing?.token || existing?.tokenSha256) ? "agent" : "ssh"));
-      if (transport === "ssh" && !(args.username?.trim() || existing?.username)) {
-        return "错误：SSH 模式需要 username（目标机登录账号），例如 remote_machine_add(id=pc1, host=1.2.3.4, username=root)。";
+      const viaSsh = transport === "ssh" || transport === "tunnel";
+      if (viaSsh && !(args.username?.trim() || existing?.username)) {
+        return "错误：SSH / 公网隧道模式需要 username（目标机登录账号），例如 remote_machine_add(id=pc1, host=1.2.3.4, username=root)。";
+      }
+      const tunnelHost = args.tunnel_host?.trim() || existing?.tunnelHost;
+      if (transport === "tunnel" && !tunnelHost) {
+        return "错误：tunnel 模式需要 tunnel_host（公网中继主机，例如 Cloudflare 隧道域名）。";
       }
       if (args.token?.trim() && args.token_sha256?.trim()) throw new Error("token 与 token_sha256 不能同时提供。");
       const supplied = Boolean(args.token?.trim() || args.token_sha256?.trim());
       const generated = transport === "agent" && !supplied && !existing?.token && !existing?.tokenSha256;
-      const token = transport === "ssh" ? (existing?.token ?? "") : (args.token?.trim() || (args.token_sha256?.trim() ? "" : existing?.token || (generated ? newToken() : "")));
-      const tokenSha256 = transport === "ssh" ? undefined : (args.token_sha256?.trim().toLowerCase() || (args.token?.trim() ? undefined : existing?.tokenSha256));
+      const token = viaSsh ? (existing?.token ?? "") : (args.token?.trim() || (args.token_sha256?.trim() ? "" : existing?.token || (generated ? newToken() : "")));
+      const tokenSha256 = viaSsh ? undefined : (args.token_sha256?.trim().toLowerCase() || (args.token?.trim() ? undefined : existing?.tokenSha256));
       if (tokenSha256 && !/^[0-9a-f]{64}$/.test(tokenSha256)) return "错误：token_sha256 必须是 64 位十六进制。";
       const tunnelUrl = args.tunnel_url?.trim() ? normalizeTunnelUrl(args.tunnel_url) : undefined;
       if (args.tunnel_url?.trim() && !tunnelUrl) return "错误：tunnel_url 必须是 http(s):// 开头的地址，如 https://xxx.trycloudflare.com。";
@@ -1307,6 +1414,8 @@ function applyInternal(ctx: Context, config: Config): void {
         host: args.host.trim(),
         port: args.port && args.port > 0 && args.port < 65536 ? Math.floor(args.port) : (existing?.port ?? 5188),
         sshPort: args.ssh_port && args.ssh_port > 0 && args.ssh_port < 65536 ? Math.floor(args.ssh_port) : existing?.sshPort,
+        tunnelHost,
+        tunnelPort: args.tunnel_port && args.tunnel_port > 0 && args.tunnel_port < 65536 ? Math.floor(args.tunnel_port) : existing?.tunnelPort,
         username: args.username?.trim() || existing?.username,
         token,
         tokenSha256,
@@ -1323,16 +1432,20 @@ function applyInternal(ctx: Context, config: Config): void {
         : generated
           ? `共享 token（仅本次展示全量）：${token}`
           : `共享 token：${token.slice(0, 6)}…（已登记，不重复展示）`;
-      if (transport === "ssh") {
+      if (transport === "ssh" || transport === "tunnel") {
         const idn = await ensureIdentity(registryPath);
         const cmds = publicKeyInstallCommand(idn.publicKey);
+        const endpoint = transport === "tunnel"
+          ? `${machine.username}@${machine.tunnelHost}:${machine.tunnelPort ?? 22}（经公网中继，目标机 SSH ${machine.host}:${machine.sshPort ?? 22}）`
+          : `${machine.username}@${machine.host}:${machine.sshPort ?? 22}`;
         return [
-          `已登记机器（SSH 传输，无需 agent）：${id} → ${machine.username}@${machine.host}:${machine.sshPort ?? 22}`,
+          `已登记机器（${transport === "tunnel" ? "公网隧道" : "SSH 直连"}，无需 agent）：${id} → ${endpoint}`,
           ...(machine.workspace ? [`目标机工作区：${machine.workspace}`] : ["提示：用 remote_workspace(machine=" + id + ", operation=set, path=...) 指定目标机工作区"]),
           "",
           "下一步：把公钥装到目标机（只需一次，之后永久免密）。在目标机执行对应命令：",
           `【Linux / macOS】\n${cmds.linux}`,
           `【Windows（目标机需开启 OpenSSH Server）】\n${cmds.windows}`,
+          ...(transport === "tunnel" ? ["", "公网隧道还需在目标机建立到公网的中继（见面板『公网接入向导』）。"] : []),
           "",
           `完成后运行 remote_ssh_setup(machine="${id}") 验证连通。`,
         ].join("\n");
@@ -1361,6 +1474,7 @@ function applyInternal(ctx: Context, config: Config): void {
       const idn = await ensureIdentity(registryPath);
       const cmds = publicKeyInstallCommand(idn.publicKey);
       if (args.action === "verify") {
+        if (machine.transport === "tunnel" && machine.tunnelForwardHost) await ensureForwarder(machine);
         const probe = await sshProbe(sshTargetOf(machine, idn.privatePath), idn.privatePath, 20_000);
         return probe.ok
           ? `SSH 连通正常：${machine.username}@${machine.host}:${machine.sshPort ?? 22}，可以直接在目标机工作。`
@@ -1881,6 +1995,68 @@ function applyInternal(ctx: Context, config: Config): void {
             }
           }
 
+          // ── 自更新 ────────────────────────────────────────────────────────────
+          if (method === "GET" && pathname === "/update/state") {
+            const st = loadUpdateState(updateStatePath);
+            const current = readInstalledVersion();
+            const pending = st.pendingRestart && st.pendingRestart !== current ? st.pendingRestart : undefined;
+            return send(res, 200, { ok: true, current, installRoot, state: st, pendingRestart: pending });
+          }
+          if (method === "POST" && pathname === "/update/config") {
+            const body = JSON.parse(await readHttpBody(req) || "{}") as Record<string, unknown>;
+            const st = loadUpdateState(updateStatePath);
+            if (typeof body.autoCheck === "boolean") st.autoCheck = body.autoCheck;
+            if (typeof body.autoInstall === "boolean") st.autoInstall = body.autoInstall;
+            if (typeof body.intervalHours === "number" && body.intervalHours >= 1) st.intervalHours = Math.min(Math.floor(body.intervalHours), 24 * 30);
+            if (typeof body.manifestUrl === "string") {
+              const url = body.manifestUrl.trim();
+              if (url && !/^https:\/\//i.test(url) && !/^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/)/i.test(url)) {
+                return send(res, 400, { ok: false, error: "清单地址必须是 https（本机调试可用 http://127.0.0.1）" });
+              }
+              st.manifestUrl = url;
+            }
+            if (typeof body.skippedVersion === "string") st.skippedVersion = body.skippedVersion.trim() || undefined;
+            saveUpdateState(updateStatePath, st);
+            return send(res, 200, { ok: true, state: st });
+          }
+          if (method === "POST" && pathname === "/update/check") {
+            const st = loadUpdateState(updateStatePath);
+            const current = readInstalledVersion();
+            const result = await checkForUpdate(current, st.manifestUrl);
+            st.lastCheckAt = Date.now();
+            st.lastCheckVersion = result.latest;
+            st.lastError = result.ok ? undefined : result.error;
+            try { saveUpdateState(updateStatePath, st); } catch { /* 状态写入失败不影响检查结果 */ }
+            return send(res, 200, { ...result, state: st });
+          }
+          if (method === "POST" && pathname === "/update/install") {
+            const st = loadUpdateState(updateStatePath);
+            const current = readInstalledVersion();
+            const body = JSON.parse(await readHttpBody(req) || "{}") as Record<string, unknown>;
+            const result = await checkForUpdate(current, st.manifestUrl);
+            if (!result.ok || !result.manifest) return send(res, 400, { ok: false, error: result.error || "无法获取更新清单" });
+            const manifest = result.manifest;
+            if (!body.reinstall && !isNewer(manifest.version, current)) {
+              return send(res, 400, { ok: false, error: `已是最新版本（${current}）` });
+            }
+            const staged = await stageUpdate(manifest, path.join(path.dirname(registryPath), "update-cache"));
+            if (!staged.ok || !staged.dir) return send(res, 500, { ok: false, error: "下载或校验失败", log: staged.log });
+            const applied = applyStaged(staged.dir, installRoot, path.join(path.dirname(registryPath), "update-backups"));
+            if (applied.ok) {
+              st.pendingRestart = manifest.version;
+              st.lastCheckVersion = manifest.version;
+              st.lastError = undefined;
+              saveUpdateState(updateStatePath, st);
+            }
+            return send(res, applied.ok ? 200 : 500, {
+              ok: applied.ok,
+              version: manifest.version,
+              backup: applied.backup,
+              restartRequired: applied.restartRequired === true,
+              log: [...staged.log, ...applied.log],
+            });
+          }
+
           if (method === "GET" && pathname === "/state") {
             const registry = readRegistry();
             const active = registry.machines.find((m) => m.id === registry.activeMachineId);
@@ -1969,7 +2145,70 @@ function applyInternal(ctx: Context, config: Config): void {
           }
 
           if (method === "GET" && pathname === "/cloudflared/status") {
-            return send(res, 200, { ok: true, ...(await cloudflaredStatus()) });
+            const found = await resolveCloudflared(cloudflaredBaseDir());
+            return send(res, 200, { ok: true, installed: Boolean(found), path: found?.path, managed: found?.managed ?? false, tunnel: quickTunnel?.state ?? null });
+          }
+
+          // 托管隧道转发：插件自己跑 cloudflared access tcp，用户无需另开终端。
+          if (method === "POST" && pathname === "/tunnel/forward/start") {
+            const body = JSON.parse(await readHttpBody(req) || "{}") as Record<string, unknown>;
+            const machineId = String(body.id ?? "").trim();
+            const machine = machineId ? findMachine(machineId) : null;
+            if (!machine) return send(res, 404, { ok: false, error: "机器未登记" });
+            const hostname = String(body.hostname ?? "").trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
+            if (!hostname || !/^[A-Za-z0-9.-]{1,253}$/.test(hostname)) {
+              return send(res, 400, { ok: false, error: "请填写 Cloudflare 隧道域名，例如 ssh.example.com" });
+            }
+            // Persist intent first so a restart can re-arm the forwarder.
+            updateMachine(machine.id, (m) => { m.transport = "tunnel"; m.tunnelForwardHost = hostname; });
+            try {
+              const fwd = await ensureForwarder(findMachine(machine.id)!);
+              return send(res, 200, { ok: true, state: fwd.state, machine: findMachine(machine.id) });
+            } catch (e) {
+              return send(res, 500, { ok: false, error: (e as Error).message, state: forwarders.get(machine.id)?.state ?? null });
+            }
+          }
+          if (method === "POST" && pathname === "/tunnel/forward/stop") {
+            const body = JSON.parse(await readHttpBody(req) || "{}") as Record<string, unknown>;
+            const machineId = String(body.id ?? "").trim();
+            const fwd = machineId ? forwarders.get(machineId) : null;
+            fwd?.stop();
+            if (machineId) forwarders.delete(machineId);
+            return send(res, 200, { ok: true });
+          }
+          if (method === "GET" && pathname === "/tunnel/forward/status") {
+            const list = [...forwarders.entries()].map(([id, f]) => ({ id, ...f.state }));
+            const found = await resolveCloudflared(cloudflaredBaseDir());
+            return send(res, 200, { ok: true, installed: Boolean(found), path: found?.path, forwarders: list });
+          }
+
+          // Quick tunnel（免登录随机域名）：把目标机 agent 的 HTTP 端口暴露到公网。
+          if (method === "POST" && pathname === "/cloudflared/quick/start") {
+            const body = JSON.parse(await readHttpBody(req) || "{}") as Record<string, unknown>;
+            const machineId = String(body.id ?? "").trim();
+            const machine = machineId ? findMachine(machineId) : null;
+            if (!machine) return send(res, 404, { ok: false, error: "机器未登记" });
+            if (machine.transport === "tunnel") return send(res, 400, { ok: false, error: "该机器已在公网隧道模式。" });
+            if (!machine.token && !machine.tokenSha256) {
+              return send(res, 400, { ok: false, error: "快速隧道需要目标机运行 agent（HTTP 端口）。请改用 Agent 传输并部署 agent。" });
+            }
+            let found = await resolveCloudflared(cloudflaredBaseDir());
+            if (!found) {
+              const inst = await installCloudflared(cloudflaredBaseDir());
+              if (!inst.ok || !inst.path) return send(res, 500, { ok: false, error: "下载 cloudflared 失败", log: inst.log });
+              found = { path: inst.path, managed: true };
+            }
+            quickTunnel = quickTunnel ?? new QuickTunnel(found.path);
+            const st = await quickTunnel.start(machine.port || 5188);
+            if (st.running && st.url) {
+              // 回填到这条机器，作为 agent 的公网地址，并优先走它。
+              updateMachine(machine.id, (m) => { m.tunnelUrl = st.url; });
+            }
+            return send(res, 200, { ok: st.running, state: st, error: st.error });
+          }
+          if (method === "POST" && pathname === "/cloudflared/quick/stop") {
+            quickTunnel?.stop();
+            return send(res, 200, { ok: true, state: quickTunnel?.state ?? null });
           }
 
           if (method === "POST" && pathname === "/save") {
@@ -1983,11 +2222,20 @@ function applyInternal(ctx: Context, config: Config): void {
             if (!username) return send(res, 400, { ok: false, error: "username 必填" });
             const osHint = body.os === "windows" || body.os === "linux" ? body.os : "auto";
             const existing = findMachine(id);
-            const transportIn = body.transport === "agent" ? "agent" : body.transport === "ssh" ? "ssh" : undefined;
-            const transport: "ssh" | "agent" = transportIn ?? existing?.transport ?? "ssh";
+            const transportIn = body.transport === "agent" ? "agent" : body.transport === "ssh" ? "ssh" : body.transport === "tunnel" ? "tunnel" : undefined;
+            const transport: "ssh" | "agent" | "tunnel" = transportIn ?? existing?.transport ?? "ssh";
+            const viaSsh = transport !== "agent";
             const tunnelUrlRaw = String(body.tunnelUrl ?? "").trim();
             const tunnelUrl = tunnelUrlRaw ? normalizeTunnelUrl(tunnelUrlRaw) : existing?.tunnelUrl;
             if (tunnelUrlRaw && !tunnelUrl) return send(res, 400, { ok: false, error: "tunnelUrl 必须是 http(s):// 地址，如 https://xxx.trycloudflare.com" });
+            const tunnelHostRaw = String(body.tunnelHost ?? "").trim();
+            if (transport === "tunnel" && !tunnelHostRaw && !existing?.tunnelHost) {
+              return send(res, 400, { ok: false, error: "公网隧道模式需要填公网地址（如 Cloudflare 隧道域名）。" });
+            }
+            if (tunnelHostRaw && !/^[A-Za-z0-9._-]{1,253}$/.test(tunnelHostRaw)) {
+              return send(res, 400, { ok: false, error: "公网地址应为域名或 IP。" });
+            }
+            const tunnelPortRaw = typeof body.tunnelPort === "number" ? Math.floor(body.tunnelPort) : Number(String(body.tunnelPort ?? "").trim() || NaN);
             const workspace = String(body.workspace ?? "").trim() || existing?.workspace;
             const sshPortRaw = typeof body.sshPort === "number" ? Math.floor(body.sshPort) : Number(String(body.sshPort ?? "").trim() || NaN);
             const registry = readRegistry();
@@ -1997,8 +2245,11 @@ function applyInternal(ctx: Context, config: Config): void {
               host,
               transport,
               sshPort: Number.isInteger(sshPortRaw) && sshPortRaw > 0 && sshPortRaw < 65536 ? sshPortRaw : existing?.sshPort,
+              tunnelHost: tunnelHostRaw || existing?.tunnelHost,
+              tunnelPort: Number.isInteger(tunnelPortRaw) && tunnelPortRaw > 0 && tunnelPortRaw < 65536 ? tunnelPortRaw : existing?.tunnelPort,
+              tunnelForwardHost: String(body.tunnelForwardHost ?? "").trim() || existing?.tunnelForwardHost,
               port: typeof body.port === "number" && body.port > 0 && body.port < 65536 ? Math.floor(body.port) : (existing?.port ?? 5188),
-              token: transport === "ssh" ? (existing?.token ?? "") : (existing?.token || newToken()),
+              token: viaSsh ? (existing?.token ?? "") : (existing?.token || newToken()),
               username, password, osHint,
               workspace,
               tunnelUrl,
@@ -2049,6 +2300,19 @@ function applyInternal(ctx: Context, config: Config): void {
             }
             if (!machine) return send(res, 400, { ok: false, error: "未指定机器：请先在列表里保存一台电脑，或传 id。" });
             const idn = await ensureIdentity(registryPath);
+            // Tunnel machines: bring up the managed forwarder before probing.
+            if (machine.transport === "tunnel" && machine.tunnelForwardHost) {
+              try { await ensureForwarder(machine); }
+              catch (e) {
+                return send(res, 200, {
+                  ok: true, connected: false, machine: machine.id,
+                  detail: `隧道转发未就绪：${(e as Error).message}`,
+                  commands: publicKeyInstallCommand(idn.publicKey),
+                });
+              }
+            }
+            // ensureForwarder rewrites tunnelHost/tunnelPort, so re-read before probing.
+            machine = findMachine(machine.id) ?? machine;
             // 20s ± one retry: first connection also writes the host key, which can be slow.
             let probe = await sshProbe(sshTargetOf(machine, idn.privatePath), idn.privatePath, 20_000);
             if (!probe.ok && /超时|timeout/i.test(probe.detail)) {

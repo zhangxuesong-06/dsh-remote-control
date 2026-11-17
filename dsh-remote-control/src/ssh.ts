@@ -8,7 +8,7 @@
  * Every command is run as a single argv array — never a shell string built by
  * concatenation — so remote-side flags/quoting cannot be injected by callers.
  */
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
@@ -112,8 +112,6 @@ function sshBaseArgs(target: SshTarget, identityFile: string): string[] {
 function runFile(file: string, args: string[], timeoutMs: number, stdin?: Buffer): SshRunResult {
   // Synchronous-ish via execFileSync is unavailable for streaming output here;
   // callers use runAsync. This sync variant is only for short local key ops.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { spawnSync } = require("node:child_process") as typeof import("node:child_process");
   const res = spawnSync(file, args, { timeout: timeoutMs, input: stdin, encoding: "utf8", windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
   return {
     code: typeof res.status === "number" ? res.status : 1,

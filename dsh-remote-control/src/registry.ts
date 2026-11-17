@@ -48,8 +48,16 @@ export interface RemoteMachine {
   workspace?: string;
   /** SSH port (default 22). */
   sshPort?: number;
-  /** Preferred transport: 'ssh' works with no agent; 'agent' needs the HTTP agent. */
-  transport?: "ssh" | "agent";
+  /** Preferred transport: 'ssh' = target's SSH port直接可达; 'tunnel' = 经公网中继（如 Cloudflare Tunnel
+   *  暴露目标机 SSH）; 'agent' = HTTP 代理。 */
+  transport?: "ssh" | "agent" | "tunnel";
+  /** transport === 'tunnel' 时，公网中继主机（域名/IP），其端口转发到目标机 SSH。 */
+  tunnelHost?: string;
+  /** transport === 'tunnel' 时，公网中继端口（默认 22）。 */
+  tunnelPort?: number;
+  /** transport === 'tunnel' 时，要转发的 Cloudflare 域名（如 ssh.example.com）。
+   *  设置后由插件托管 `cloudflared access tcp`，tunnelHost/tunnelPort 指向本地转发端口。 */
+  tunnelForwardHost?: string;
   /** Optional per-machine SSH private key path; defaults to the plugin-managed key. */
   sshIdentityFile?: string;
   /** Remote OS platform, learned from /health (win32/linux/darwin). */
@@ -143,7 +151,10 @@ export function normalizeMachine(raw: unknown): RemoteMachine | null {
     enabled: record.enabled !== false,
     workspace: typeof record.workspace === "string" && record.workspace ? record.workspace : undefined,
     sshPort: typeof record.sshPort === "number" && Number.isInteger(record.sshPort) && record.sshPort > 0 && record.sshPort < 65536 ? record.sshPort : undefined,
-    transport: record.transport === "agent" || record.transport === "ssh" ? record.transport : undefined,
+    transport: record.transport === "agent" || record.transport === "ssh" || record.transport === "tunnel" ? record.transport : undefined,
+    tunnelHost: typeof record.tunnelHost === "string" && record.tunnelHost.trim() ? record.tunnelHost.trim() : undefined,
+    tunnelPort: typeof record.tunnelPort === "number" && Number.isInteger(record.tunnelPort) && record.tunnelPort > 0 && record.tunnelPort < 65536 ? record.tunnelPort : undefined,
+    tunnelForwardHost: typeof record.tunnelForwardHost === "string" && record.tunnelForwardHost.trim() ? record.tunnelForwardHost.trim() : undefined,
     sshIdentityFile: typeof record.sshIdentityFile === "string" && record.sshIdentityFile ? record.sshIdentityFile : undefined,
     platform: typeof record.platform === "string" && record.platform ? record.platform : undefined,
     paths: paths && paths.length > 0 ? paths : undefined,

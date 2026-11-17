@@ -128,9 +128,24 @@ remote_connect_reverse(id=build-pc, host=192.168.1.30, controller_host=<目标�
 控制器的网关需对目标机可达；本地代理端口无需向公网开放。
 复取部署命令使用 `remote_deploy_command(machine=build-pc)`。
 
-### 公网 HTTP 隧道
+### 公网 SSH 隧道（控制没有 agent 的电脑）
 
-目标机运行 agent，再用 Cloudflare Tunnel、ngrok 或其他 HTTP 隧道转发 agent 端口。
+目标机不需要 agent，只要 sshd。把它暴露到公网后，插件按普通 SSH 连接即可。
+
+设置页把连接方式选「公网隧道」，填公网域名与端口。**本机侧的转发进程由插件托管**：它会自动获取 cloudflared、分配本地端口、建立并守护 `cloudflared access tcp`，掉线自动重连——不需要你另外开一个终端常驻命令。
+
+Cloudflare（Token 模式，需免费账号 + 域名）：
+
+1. Zero Trust 控制台 → Networks → Tunnels → Create a tunnel → 选 Cloudflared，复制给出的 `cloudflared tunnel run --token …`。
+2. 在该隧道里 Add a public hostname：Subdomain `ssh`、Domain 选你的域名、Type **SSH**、URL `localhost:22`。
+3. 目标机安装 cloudflared 后运行第 1 步复制的命令（保持运行）。插件面板会给出按系统选择的可复制命令。
+4. 设置页填该域名（如 `ssh.example.com`）→ 点「建立转发」。插件自动完成本机侧一切并回填公网地址/端口。
+
+只有第 3 步必须在目标机上长期运行；控制器侧完全由插件负责。
+
+### 公网 HTTP 隧道（agent 模式，可选）
+
+目标机运行 agent，再用 Cloudflare Tunnel、ngrok 或其他 HTTP 隧道转发 agent 端口。这条路径要求目标机上有 agent。
 
 **先装 cloudflared**（按目标机系统选一种，详见 [官方下载页](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)）：
 
@@ -243,6 +258,33 @@ agent 1.5.0 的 `/health` 上报忙碌任务数及保持唤醒状态。
 
 构建 host 与前端产物后用 `npm pack` 分发，确保运行依赖可解析，并在当前 profile 的 `dsh.profile.bundles` 加入 `@dsh-external/dsh-remote-control`。重启 DSH 后生效；前端 bundle 更新后刷新现有页面。
 登记表位于 `DSH_HOME/dsh-remote-control/machines.json`，未配置 `DSH_HOME` 时使用用户目录下的 `.dsh-remote-control`。
+
+## 自动更新
+
+设置页底部「插件更新」卡片：显示当前版本、检查更新、一键安装；安装完成提示重启 DSH 后生效。
+
+**流程**：读取清单 → 下载 tarball → 校验 sha256 → 检查归档是否安全 → 校验包名与版本 → 备份当前版本 → 替换发布文件 → 复核版本（失败自动回滚）。
+
+安全约束（不可关闭）：
+
+- 清单没有 `sha256` 直接拒绝；哈希不匹配的包立即丢弃。
+- 清单与 tarball 只允许 `https`；仅本机调试允许 `http://127.0.0.1`。
+- 归档内出现 `..`、绝对路径（含 Windows 盘符）、符号链接或特殊文件即拒绝。
+- 包名必须是 `@dsh-external/dsh-remote-control`，包内版本必须与清单一致。
+- 只替换 `lib/`、`agent/`、`package.json` 等发布文件；机器登记表与你的数据不受影响。
+
+默认**只检查不安装**。可在「更新设置」里开启自动安装（仍需重启生效），或改自建清单地址。
+
+**发布新版**（维护者）：
+
+```bash
+node scripts/make-release.mjs --notes "本次更新说明"
+```
+
+产出 `releases/<name>-<version>.tgz` 与 `releases/manifest.json`（含 sha256）。把两者提交/上传到仓库的 `releases/` 目录即可；已安装的插件会从
+`https://raw.githubusercontent.com/zhangxuesong-06/dsh-remote-control/main/releases/manifest.json` 读取清单，GitHub 不可达时自动回退镜像。
+
+状态与备份位置：`<登记表目录>/update-state.json`、`update-cache/`、`update-backups/`。
 
 ## 凭据与权限边界
 

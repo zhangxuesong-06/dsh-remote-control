@@ -297,6 +297,183 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
         );
       }
 
+      // 公网接入向导（Cloudflare Tunnel 暴露目标机 SSH）。
+      function PublicTunnelHelp(props) {
+        var setMsg = props.setMsg;
+        var [mode, setMode] = react.useState("cloudflare"); // cloudflare | custom
+        var [hostname, setHostname] = react.useState(props.forwardHost || "");
+        var [fwd, setFwd] = react.useState(null);
+        var [busy, setBusy] = react.useState(false);
+        var host = props.host || "<目标机IP>";
+        var sshPort = props.sshPort || "22";
+
+        react.useEffect(function () {
+          fetchJson("/tunnel/forward/status").then(function (r) {
+            if (!r || !r.ok) return;
+            var mine = (r.forwarders || []).find(function (f) { return f.id === props.machineId; });
+            if (mine) { setFwd(mine); if (mine.hostname) setHostname(mine.hostname); }
+          }).catch(function () {});
+        }, [props.machineId]);
+
+        function startForward() {
+          if (!props.machineId) { setMsg({ text: "先点下方「保存」登记这台电脑，再建立转发。", err: true }); return; }
+          var hn = String(hostname || "").trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "");
+          if (!hn) { setMsg({ text: "请填写 Cloudflare 隧道域名，例如 ssh.example.com", err: true }); return; }
+          setBusy(true);
+          fetchJson("/tunnel/forward/start", { method: "POST", body: JSON.stringify({ id: props.machineId, hostname: hn }) })
+            .then(function (r) {
+              setBusy(false);
+              if (r && r.ok) {
+                setFwd(r.state);
+                if (props.onForwarded && r.machine) props.onForwarded(r.machine);
+                setMsg({ text: "✅ 隧道转发已就绪：本机 127.0.0.1:" + r.state.localPort + " → " + r.state.hostname + "（已自动填入公网地址/端口，点保存生效）", err: false });
+              } else {
+                setFwd(r && r.state ? r.state : null);
+                setMsg({ text: "建立转发失败：" + ((r && r.error) || "未知原因"), err: true });
+              }
+            })
+            .catch(function (e) { setBusy(false); setMsg({ text: String(e), err: true }); });
+        }
+        function stopForward() {
+          setBusy(true);
+          fetchJson("/tunnel/forward/stop", { method: "POST", body: JSON.stringify({ id: props.machineId }) })
+            .then(function () { setBusy(false); setFwd(null); setMsg({ text: "已停止隧道转发。", err: false }); })
+            .catch(function (e) { setBusy(false); setMsg({ text: String(e), err: true }); });
+        }
+
+        function copy(text, what) {
+          if (copyText(text)) setMsg({ text: what + " 已复制。", err: false });
+          else setMsg({ text: "复制失败，请手动复制。", err: true });
+        }
+        function cmdBlock(title, text) {
+          return h("div", null,
+            h("div", { className: "dshrc-label", style: { margin: "6px 0 3px" } }, title),
+            h("div", { className: "dshrc-code" }, text,
+              h("button", { className: "dshrc-btn sm copy", onClick: function () { copy(text, title); } }, "复制")),
+          );
+        }
+
+        // 本机侧完全托管：插件自动下载 cloudflared、起 access、挑端口、掉线自愈。
+        var managed = h("div", null,
+          h("div", { className: "dshrc-label", style: { margin: "8px 0 3px", fontWeight: 600 } }, "④ 本机转发（插件自动托管，无需你开终端）"),
+          h("div", { className: "note" }, "只需填控制台里配好的 SSH 域名，插件会自动下载 cloudflared、建立并保持本地转发，掉线自动重连。"),
+          h("div", { className: "row", style: { marginTop: "4px" } },
+            h("input", {
+              className: "dshrc-input", style: { flex: "1", minWidth: "160px" },
+              value: hostname, placeholder: "ssh.example.com",
+              onChange: function (e) { setHostname(e.target.value); },
+            }),
+            fwd && fwd.running
+              ? h("button", { className: "dshrc-btn sm", disabled: busy, onClick: stopForward }, busy ? "处理中…" : "停止转发")
+              : h("button", { className: "dshrc-btn sm primary", disabled: busy, onClick: startForward }, busy ? "建立中…" : "建立转发"),
+          ),
+          fwd && fwd.running
+            ? h("div", { className: "note", style: { color: "var(--dsw-alias-state-success-primary)" } },
+                "✅ 运行中：127.0.0.1:" + fwd.localPort + " → " + fwd.hostname + (fwd.restarts ? "（已自动重连 " + fwd.restarts + " 次）" : ""))
+            : null,
+          fwd && fwd.error
+            ? h("div", { className: "note", style: { color: "var(--dsw-alias-state-error-primary)" } }, "转发错误：" + fwd.error)
+            : null,
+        );
+
+        var cfSteps = null;
+        if (mode === "cloudflare") {
+          cfSteps = h("div", null,
+            h("div", { className: "note" }, "需要免费 Cloudflare 账号 + 一个域名（一次配置，长期稳定）。用「网页建隧道」的 Token 模式，目标机只需跑一条命令，配置全在网页上点。"),
+            h("div", { className: "dshrc-label", style: { margin: "6px 0 3px" } }, "① 在 Cloudflare Zero Trust 控制台建隧道（网页操作）"),
+            h("div", { className: "note" }, "Networks → Tunnels → Create a tunnel → 选 Cloudflared → 起个名字 → 复制给的 `cloudflared tunnel run --token …`。然后在隧道里 Add a public hostname：Subdomain 填 ssh、Domain 选你的域名、Type 选 SSH、URL 填 localhost:22。"),
+            cmdBlock("② 目标机安装 cloudflared（Linux，已装可跳过）", cloudflaredInstallHint()),
+            cmdBlock("③ 目标机运行隧道（粘贴①里复制的整条命令，保持运行）",
+              `cloudflared tunnel run --token <你在控制台复制的一长串>`),
+            managed,
+            h("div", { className: "note", style: { marginTop: "4px" } },
+              "完成后公网地址/端口会自动填成 127.0.0.1 和插件分配的端口，点「保存」即可。目标机 IP 与 SSH 端口照常填真实值。"),
+          );
+        } else {
+          cfSteps = h("div", null,
+            h("div", { className: "note" }, "如果你已有公网服务器（VPS）或用 frp/自建中转，把目标机 SSH 转发到公网某个 域名:端口，然后在这里填那个地址即可（这种不需要本机转发进程）。"),
+            cmdBlock("自建 frp 示例（在 VPS 上，frps.ini）",
+              `[common]\nbind_port = 7000\n[ssh]\ntype = tcp\nlocal_ip = 127.0.0.1\nlocal_port = ${sshPort}\nremote_port = 6000`),
+            cmdBlock("目标机（frpc.ini，连接你的 VPS）",
+              `[common]\nserver_addr = 你的VPS公网IP\nserver_port = 7000\n[ssh]\ntype = tcp\nlocal_ip = 127.0.0.1\nlocal_port = ${sshPort}\nremote_port = 6000`),
+            h("div", { className: "note" }, "完成后：公网地址填 VPS 公网 IP，公网端口填 6000。"),
+          );
+        }
+
+        return h("div", { className: "dshrc-tunnel" },
+          h("div", { className: "row" },
+            h("span", { className: "cnt", style: { fontWeight: 600 } }, "公网接入向导"),
+            h("button", { className: "dshrc-btn sm" + (mode === "cloudflare" ? " primary" : ""), onClick: function () { setMode("cloudflare"); } }, "Cloudflare（推荐）"),
+            h("button", { className: "dshrc-btn sm" + (mode === "custom" ? " primary" : ""), onClick: function () { setMode("custom"); } }, "自定义中继 / VPS"),
+          ),
+          cfSteps,
+          h("div", { className: "note", style: { marginTop: "6px" } },
+            "提示：目标机还要把公钥装好（见下方 SSH 首次连接）。公网只是改变了“从哪连”，认证方式不变。"),
+        );
+      }
+
+      function cloudflaredInstallHint() {
+        return "# Debian/Ubuntu:\ncurl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null\n" +
+          'echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" | sudo tee /etc/apt/sources.list.d/cloudflared.list\n' +
+          "sudo apt update && sudo apt install -y cloudflared\n# 或直接下载二进制：https://github.com/cloudflare/cloudflared/releases/latest";
+      }
+
+      // 临时公网隧道（免登录随机域名）：一键把目标机 agent 的 HTTP 端口暴露到公网。
+      function QuickTunnelHelp(props) {
+        var setMsg = props.setMsg;
+        var [busy, setBusy] = react.useState(false);
+        var [state, setState] = react.useState(null); // {running,url,error,log}
+
+        react.useEffect(function () {
+          fetchJson("/cloudflared/status").then(function (r) { if (r && r.ok && r.tunnel) setState(r.tunnel); }).catch(function () {});
+        }, []);
+
+        function start() {
+          if (!props.machineId) { setMsg({ text: "请先点下方「保存」登记这台电脑，再开启隧道。", err: true }); return; }
+          setBusy(true);
+          setMsg({ text: "正在下载/启动 cloudflared 并建立隧道（首次可能需要几十秒，需能访问 GitHub）…", err: false });
+          fetchJson("/cloudflared/quick/start", { method: "POST", body: JSON.stringify({ id: props.machineId }) })
+            .then(function (r) {
+              setBusy(false);
+              if (r && r.ok && r.state && r.state.url) {
+                setState(r.state);
+                if (props.onUrl) props.onUrl(r.state.url);
+                setMsg({ text: "✅ 临时公网地址已生成：" + r.state.url + "（已自动填到上方地址框，保存后生效）", err: false });
+              } else {
+                setState(r && r.state ? r.state : null);
+                setMsg({ text: "开启失败：" + ((r && (r.error || (r.state && r.state.error))) || "未知") + (r && r.log ? "\n" + r.log.join("\n") : ""), err: true });
+              }
+            })
+            .catch(function (e) { setBusy(false); setMsg({ text: String(e), err: true }); });
+        }
+        function stop() {
+          setBusy(true);
+          fetchJson("/cloudflared/quick/stop", { method: "POST", body: "{}" })
+            .then(function () { setBusy(false); setState(null); setMsg({ text: "已关闭临时隧道。", err: false }); })
+            .catch(function (e) { setBusy(false); setMsg({ text: String(e), err: true }); });
+        }
+
+        return h("div", { className: "dshrc-tunnel" },
+          h("div", { className: "dshrc-label", style: { fontWeight: 600, marginBottom: "4px" } }, "临时公网访问（免登录、随机域名）"),
+          h("div", { className: "note" },
+            "适合临时从外网连这台电脑：一键在本机起 Cloudflare 隧道，把目标机 agent 端口暴露成一个 xxx.trycloudflare.com 地址（无需公网 IP、无需账号）。地址每次重开会变；长期使用建议固定域名隧道。"),
+          h("div", { className: "row", style: { marginTop: "6px" } },
+            state && state.running
+              ? h("button", { className: "dshrc-btn sm", disabled: busy, onClick: stop }, busy ? "处理中…" : "关闭隧道")
+              : h("button", { className: "dshrc-btn sm primary", disabled: busy, onClick: start }, busy ? "建立中…" : "一键开启临时公网隧道"),
+            state && state.url
+              ? h("span", { className: "cnt", style: { fontFamily: "ui-monospace,monospace" } }, state.url)
+              : null,
+          ),
+          state && state.error
+            ? h("div", { className: "note", style: { color: "var(--dsw-alias-state-error-primary)" } }, "隧道错误：" + state.error)
+            : null,
+          state && state.running && state.log && state.log.length
+            ? h("div", { className: "note", style: { fontFamily: "ui-monospace,monospace", maxHeight: "120px", overflow: "auto" } }, state.log.slice(-8).join("\n"))
+            : null,
+        );
+      }
+
       // 公网隧道帮助：按目标机系统给出安装+启动命令，并提供一键为本机安装。
       function TunnelHelp(props) {
         var setMsg = props.setMsg;
@@ -483,7 +660,7 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
       }
 
       function RemoteControlSection() {
-        var [form, setForm] = react.useState({ id: "", name: "", host: "", username: "", password: "", os: "auto", port: "5188", sshPort: "22", transport: "ssh", workspace: "", tunnelUrl: "", autoConnect: false });
+        var [form, setForm] = react.useState({ id: "", name: "", host: "", username: "", password: "", os: "auto", port: "5188", sshPort: "22", transport: "ssh", tunnelHost: "", tunnelPort: "22", tunnelForwardHost: "", workspace: "", tunnelUrl: "", autoConnect: false });
         var [busy, setBusy] = react.useState("");
         var [msg, setMsg] = react.useState(null);
         var [machines, setMachines] = react.useState([]);
@@ -590,6 +767,8 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
             id: m.id, name: m.name || "", host: m.host || "", username: m.username || "",
             password: "", os: m.osHint || "auto", port: String(m.port || 5188),
             sshPort: String(m.sshPort || 22), transport: m.transport || "ssh",
+            tunnelHost: m.tunnelHost || "", tunnelPort: String(m.tunnelPort || 22),
+            tunnelForwardHost: m.tunnelForwardHost || "",
             workspace: m.workspace || "", tunnelUrl: m.tunnelUrl || "", autoConnect: Boolean(m.autoConnect),
           });
           setSavedId(m.id);
@@ -676,22 +855,32 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
               field("IP 地址 *", form.host, setField("host"), { placeholder: "192.168.1.20" }),
               field("登录用户名 *", form.username, setField("username"), { placeholder: "root / Administrator / 你的账号" }),
               h("label", { className: "dshrc-field" },
-                h("span", { className: "dshrc-label" }, "传输方式"),
+                h("span", { className: "dshrc-label" }, "连接方式"),
                 h("select", { className: "dshrc-input", value: form.transport, onChange: function (e) { setField("transport")(e.target.value); } },
-                  h("option", { value: "ssh" }, "SSH（无需 agent）"),
+                  h("option", { value: "ssh" }, "局域网 / 直连 SSH"),
+                  h("option", { value: "tunnel" }, "公网隧道（跨互联网）"),
                   h("option", { value: "agent" }, "Agent（HTTP 代理）"),
                 ),
               ),
-              form.transport === "ssh"
+              form.transport === "agent"
                 ? h("label", { className: "dshrc-field" },
-                    h("span", { className: "dshrc-label" }, "SSH 端口"),
-                    h("input", { className: "dshrc-input", type: "number", value: form.sshPort, placeholder: "22", onChange: function (e) { setField("sshPort")(e.target.value); } }),
-                  )
-                : h("label", { className: "dshrc-field" },
                     h("span", { className: "dshrc-label" }, "Agent 端口"),
                     h("input", { className: "dshrc-input", type: "number", value: form.port, placeholder: "5188", onChange: function (e) { setField("port")(e.target.value); } }),
+                  )
+                : h("label", { className: "dshrc-field" },
+                    h("span", { className: "dshrc-label" }, "SSH 端口"),
+                    h("input", { className: "dshrc-input", type: "number", value: form.sshPort, placeholder: "22", onChange: function (e) { setField("sshPort")(e.target.value); } }),
                   ),
             ),
+            form.transport === "tunnel"
+              ? h("div", { className: "dshrc-grid" },
+                  field("公网地址 *", form.tunnelHost, setField("tunnelHost"), { className: "dshrc-field wide", placeholder: "ssh.example.com（Cloudflare 隧道域名 / 公网 IP）" }),
+                  h("label", { className: "dshrc-field" },
+                    h("span", { className: "dshrc-label" }, "公网端口"),
+                    h("input", { className: "dshrc-input", type: "number", value: form.tunnelPort, placeholder: "22", onChange: function (e) { setField("tunnelPort")(e.target.value); } }),
+                  ),
+                )
+              : null,
             h("div", { className: "dshrc-grid" },
               field("目标机工作区（绝对路径）", form.workspace, setField("workspace"), { className: "dshrc-field wide", placeholder: "如 /srv/projects 或 D:\\work —— 之后所有操作默认在这里执行" }),
             ),
@@ -704,8 +893,27 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
                     ),
                     field("公网隧道地址（可选）", form.tunnelUrl, setField("tunnelUrl"), { className: "dshrc-field wide", placeholder: "https://xxx.trycloudflare.com" }),
                   ),
-                  h(TunnelHelp, { setMsg: setMsg }),
+                  h(QuickTunnelHelp, { setMsg: setMsg, machineId: savedId, onUrl: function (url) { setField("tunnelUrl")(url); } }),
                 )
+              : null,
+            form.transport === "tunnel"
+              ? h(PublicTunnelHelp, {
+                  setMsg: setMsg,
+                  machineId: savedId,
+                  host: form.host,
+                  sshPort: form.sshPort,
+                  forwardHost: form.tunnelForwardHost,
+                  onForwarded: function (m) {
+                    setForm(function (prev) {
+                      return Object.assign({}, prev, {
+                        tunnelHost: m.tunnelHost || prev.tunnelHost,
+                        tunnelPort: String(m.tunnelPort || prev.tunnelPort),
+                        tunnelForwardHost: m.tunnelForwardHost || prev.tunnelForwardHost,
+                        transport: "tunnel",
+                      });
+                    });
+                  },
+                })
               : null,
             h("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" } },
               h("label", { className: "dshrc-check" },
@@ -734,6 +942,121 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
           items.length > 0
             ? items
             : h("div", { className: "dshrc-empty" }, "还没有保存的目标机。填写上方表单保存，或在对话里用 remote_connect 接入。"),
+
+          h(UpdateCard, { setMsg: setMsg }),
+        );
+      }
+
+      // 插件自更新：检查 → 下载校验 → 备份替换 → 重启生效。
+      function UpdateCard(props) {
+        var setMsg = props.setMsg;
+        var [st, setSt] = react.useState(null);      // /update/state 响应
+        var [check, setCheck] = react.useState(null); // 检查结果
+        var [busy, setBusy] = react.useState("");
+        var [log, setLog] = react.useState([]);
+        var [showCfg, setShowCfg] = react.useState(false);
+        var [manifest, setManifest] = react.useState("");
+
+        function load() {
+          fetchJson("/update/state").then(function (r) {
+            if (r && r.ok) { setSt(r); setManifest((r.state && r.state.manifestUrl) || ""); }
+          }).catch(function () {});
+        }
+        react.useEffect(load, []);
+
+        function doCheck() {
+          setBusy("check"); setLog([]);
+          fetchJson("/update/check", { method: "POST", body: "{}" })
+            .then(function (r) {
+              setBusy("");
+              if (r && r.ok) { setCheck(r); load(); }
+              else { setCheck({ ok: false, error: (r && r.error) || "检查失败" }); }
+            })
+            .catch(function (e) { setBusy(""); setCheck({ ok: false, error: String(e) }); });
+        }
+        function doInstall() {
+          if (!window.confirm("安装新版本？当前版本会自动备份，重启 DSH 后生效。")) return;
+          setBusy("install"); setLog(["正在下载并校验…"]);
+          fetchJson("/update/install", { method: "POST", body: "{}" })
+            .then(function (r) {
+              setBusy("");
+              setLog((r && r.log) || []);
+              if (r && r.ok) {
+                setMsg({ text: "已安装 " + r.version + "，重启 DSH 后生效。", err: false });
+                load(); setCheck(null);
+              } else {
+                setMsg({ text: "更新失败：" + ((r && r.error) || "未知原因") + "（已自动回滚）", err: true });
+              }
+            })
+            .catch(function (e) { setBusy(""); setLog([String(e)]); setMsg({ text: "更新失败：" + String(e), err: true }); });
+        }
+        function saveCfg(patch) {
+          fetchJson("/update/config", { method: "POST", body: JSON.stringify(patch) })
+            .then(function (r) { if (r && r.ok) { setSt(function (p) { return Object.assign({}, p, { state: r.state }); }); } else setMsg({ text: "保存设置失败：" + ((r && r.error) || ""), err: true }); })
+            .catch(function (e) { setMsg({ text: String(e), err: true }); });
+        }
+
+        var cur = st ? st.current : "";
+        var stt = st ? st.state : null;
+        var latest = check && check.ok ? check.latest : null;
+        var hasUpdate = Boolean(check && check.ok && check.updateAvailable);
+        var pending = st && st.pendingRestart;
+
+        return h("div", { className: "dshrc-card" },
+          h("div", { className: "dshrc-cardhead" },
+            h("span", { className: "dshrc-cardtitle" }, "插件更新"),
+            h("span", { className: "dshrc-kv" }, cur ? "当前 " + cur : "读取版本中…"),
+          ),
+          pending
+            ? h("div", { className: "note", style: { color: "var(--dsw-alias-state-success-primary)" } },
+                "已安装 " + pending + "，重启 DSH 后生效。")
+            : null,
+          h("div", { className: "row", style: { marginTop: "6px" } },
+            h("button", { className: "dshrc-btn sm", disabled: busy !== "", onClick: doCheck }, busy === "check" ? "检查中…" : "检查更新"),
+            hasUpdate
+              ? h("button", { className: "dshrc-btn sm primary", disabled: busy !== "", onClick: doInstall }, busy === "install" ? "安装中…" : "安装 " + latest)
+              : null,
+            h("button", { className: "dshrc-btn sm", onClick: function () { setShowCfg(!showCfg); } }, showCfg ? "收起设置" : "更新设置"),
+          ),
+          check
+            ? h("div", { className: "note", style: {
+                color: check.ok && !check.updateAvailable ? "var(--dsw-alias-state-success-primary)"
+                  : check.ok ? "var(--dsw-alias-label-primary)" : "var(--dsw-alias-state-error-primary)",
+              } },
+                check.ok
+                  ? (check.updateAvailable ? "发现新版本 " + check.latest + "。" : "已是最新版本（" + check.current + "）。")
+                    + (check.manifest && check.manifest.notes ? " " + check.manifest.notes : "")
+                  : "检查失败：" + check.error)
+            : null,
+          stt && stt.lastCheckAt && !check
+            ? h("div", { className: "note" }, "上次检查：" + new Date(stt.lastCheckAt).toLocaleString()
+                + (stt.lastCheckVersion ? "（远端 " + stt.lastCheckVersion + "）" : "")
+                + (stt.lastError ? " · " + stt.lastError : ""))
+            : null,
+          showCfg
+            ? h("div", null,
+                h("label", { className: "dshrc-check", style: { marginTop: "6px" } },
+                  h("input", { type: "checkbox", checked: Boolean(stt && stt.autoCheck), onChange: function (e) { saveCfg({ autoCheck: e.target.checked }); } }),
+                  "自动检查更新（后台每日一次）",
+                ),
+                h("label", { className: "dshrc-check" },
+                  h("input", { type: "checkbox", checked: Boolean(stt && stt.autoInstall), onChange: function (e) { saveCfg({ autoInstall: e.target.checked }); } }),
+                  "发现新版本时自动安装（仍需重启生效）",
+                ),
+                h("div", { className: "row", style: { marginTop: "4px" } },
+                  h("input", {
+                    className: "dshrc-input", style: { flex: "1", minWidth: "180px" },
+                    value: manifest, placeholder: "清单地址（留空用默认）",
+                    onChange: function (e) { setManifest(e.target.value); },
+                  }),
+                  h("button", { className: "dshrc-btn sm", onClick: function () { saveCfg({ manifestUrl: manifest }); } }, "保存"),
+                ),
+                h("div", { className: "note" }, "安装前会校验清单里的 sha256，不匹配直接丢弃；旧版本自动备份，失败会回滚。"),
+              )
+            : null,
+          log.length
+            ? h("div", { className: "note", style: { fontFamily: "ui-monospace,monospace", maxHeight: "140px", overflow: "auto" } }, log.join("\n"))
+            : null,
         );
       }
 

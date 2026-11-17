@@ -40,7 +40,7 @@ export interface Executor {
 /** True when the machine should be driven over SSH (no agent available). */
 export function usesSsh(machine: RemoteMachine): boolean {
   if (machine.transport === "agent") return false;
-  if (machine.transport === "ssh") return true;
+  if (machine.transport === "ssh" || machine.transport === "tunnel") return true;
   // Default: SSH when no agent token was ever issued for the machine.
   return !machine.token && !machine.tokenSha256;
 }
@@ -48,10 +48,16 @@ export function usesSsh(machine: RemoteMachine): boolean {
 export function sshTargetOf(machine: RemoteMachine, identityFile: string): SshTarget & { identityFile: string } {
   if (!machine.username) throw new Error(`机器 "${machine.id}" 使用 SSH 传输但未配置用户名（SSH 登录账号）。`);
   const idFile = machine.sshIdentityFile || identityFile;
+  const viaTunnel = machine.transport === "tunnel";
+  // Tunnel mode connects to the public relay host/port instead of the LAN address.
+  const host = viaTunnel && machine.tunnelHost ? machine.tunnelHost : machine.host;
+  const port = viaTunnel
+    ? (machine.tunnelPort && machine.tunnelPort > 0 ? machine.tunnelPort : 22)
+    : (machine.sshPort && machine.sshPort > 0 ? machine.sshPort : 22);
   return {
     id: machine.id,
-    host: machine.host,
-    port: machine.sshPort && machine.sshPort > 0 ? machine.sshPort : 22,
+    host,
+    port,
     username: machine.username,
     identityFile: idFile,
     knownHostsFile: defaultKnownHostsFile(idFile),

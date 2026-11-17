@@ -25,3 +25,6 @@ desktop.ini
 
 # ── 机器登记表（含 token 与登录密码，只存在用户目录）──────────────
 machines.json
+
+# 发布产物（供自动更新使用，体积小可提交）
+!releases/*.tgz
