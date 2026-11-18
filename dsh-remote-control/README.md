@@ -29,7 +29,7 @@ remote_fs(machine=build-pc, operation=read, path="README.md")   # 相对路径 =
 - Linux：`apt install openssh-server`（多数已自带），`systemctl enable --now ssh`
 - Windows：设置 → 可选功能 → 添加「OpenSSH 服务器」，`Start-Service sshd; Set-Service sshd -StartupType Automatic`
 
-在设置页「远程控制」面板里填 IP + 用户名 + 工作区点「保存」，面板会直接给出可复制的公钥安装命令和一个「验证 SSH 连通」按钮。
+点击左侧工作区栏的「远程控制」（与「插件」「自动化任务」并列），填 IP + 用户名 + 工作区点「保存」，面板会直接给出可复制的公钥安装命令和一个「验证 SSH 连通」按钮。
 
 ## 能做什么
 
@@ -132,14 +132,14 @@ remote_connect_reverse(id=build-pc, host=192.168.1.30, controller_host=<目标�
 
 目标机不需要 agent，只要 sshd。把它暴露到公网后，插件按普通 SSH 连接即可。
 
-设置页把连接方式选「公网隧道」，填公网域名与端口。**本机侧的转发进程由插件托管**：它会自动获取 cloudflared、分配本地端口、建立并守护 `cloudflared access tcp`，掉线自动重连——不需要你另外开一个终端常驻命令。
+在「远程控制」面板把连接方式选「公网隧道」，填公网域名与端口。**本机侧的转发进程由插件托管**：它会自动获取 cloudflared、分配本地端口、建立并守护 `cloudflared access tcp`，掉线自动重连——不需要你另外开一个终端常驻命令。
 
 Cloudflare（Token 模式，需免费账号 + 域名）：
 
 1. Zero Trust 控制台 → Networks → Tunnels → Create a tunnel → 选 Cloudflared，复制给出的 `cloudflared tunnel run --token …`。
 2. 在该隧道里 Add a public hostname：Subdomain `ssh`、Domain 选你的域名、Type **SSH**、URL `localhost:22`。
 3. 目标机安装 cloudflared 后运行第 1 步复制的命令（保持运行）。插件面板会给出按系统选择的可复制命令。
-4. 设置页填该域名（如 `ssh.example.com`）→ 点「建立转发」。插件自动完成本机侧一切并回填公网地址/端口。
+4. 面板里填该域名（如 `ssh.example.com`）→ 点「建立转发」。插件自动完成本机侧一切并回填公网地址/端口。
 
 只有第 3 步必须在目标机上长期运行；控制器侧完全由插件负责。
 
@@ -155,7 +155,7 @@ Cloudflare（Token 模式，需免费账号 + 域名）：
 | macOS | `brew install cloudflared` |
 | Linux (Debian/Ubuntu) | 加官方 GPG + 源后 `sudo apt install cloudflared`（具体见下方或 README 面板） |
 
-> 目标机就是本机时，可直接点设置页里的「**为本机安装 cloudflared**」按钮一键安装；面板也会按你选的系统给出可复制的完整命令。
+> 目标机就是本机时，可直接点面板里的「**为本机安装 cloudflared**」按钮一键安装；面板也会按你选的系统给出可复制的完整命令。
 
 然后启动隧道：
 
@@ -244,13 +244,13 @@ agent 1.5.0 的 `/health` 上报忙碌任务数及保持唤醒状态。
 - 触发器显示当前环境名：`本机` 或 `电脑名`；名字过长自动省略。
 - 点开是一个列表：**本机 + 所有已登记电脑**平铺，选中项打勾，每项显示工作区、是否停用。
 - 选「本机」= 用当前这台电脑；选某台电脑后，远程工具省略 `machine` 默认作用在它上面。
-- 设置页电脑卡片同样有「设为当前 / 切回本机」。
+- 面板里的电脑卡片同样有「设为当前 / 切回本机」。
 
 > 这只是**工具默认目标**的快捷方式，不是会话隔离，也不改变命令权限；显式 `machine=...` 始终优先。
 
-## 设置页与安装
+## 控制面板与安装
 
-设置页「远程控制」为卡片式布局：上方是「添加 / 连接一台电脑」表单（名称、IP、用户名、密码、系统、端口、公网隧道地址、自动探测），下方是「已保存的电脑」列表，卡片显示在线/繁忙/OS/隧道徽标、主机名、agent 版本、最后在线、默认执行目录与默认环境变量**名称**。面板和工具共用同一份登记表。
+左侧工作区栏的「远程控制」为整页卡片式布局：上方是「添加 / 连接一台电脑」表单（名称、IP、用户名、密码、系统、端口、公网隧道地址、自动探测），下方是「已保存的电脑」列表，卡片显示在线/繁忙/OS/隧道徽标、主机名、agent 版本、最后在线、默认执行目录与默认环境变量**名称**。面板和工具共用同一份登记表。
 
 > 远程命令只在**目标机**上执行：`remote_exec` / `remote_fs` / 上传下载的相对路径都基于**目标机的工作区**（用 `remote_workspace` 设置）。没有“本机工作区”这个概念。
 > 公网隧道：目标机执行 `cloudflared tunnel --url http://127.0.0.1:5188`，把输出的 `https://…` 填进表单的「公网隧道地址」，或 `remote_tunnel(machine, action=set, url=…)`。
@@ -261,7 +261,7 @@ agent 1.5.0 的 `/health` 上报忙碌任务数及保持唤醒状态。
 
 ## 自动更新
 
-设置页底部「插件更新」卡片：显示当前版本、检查更新、一键安装；安装完成提示重启 DSH 后生效。
+面板底部「插件更新」卡片：显示当前版本、检查更新、一键安装；安装完成提示重启 DSH 后生效。
 
 **流程**：读取清单 → 下载 tarball → 校验 sha256 → 检查归档是否安全 → 校验包名与版本 → 备份当前版本 → 替换发布文件 → 复核版本（失败自动回滚）。
 
@@ -309,13 +309,13 @@ node scripts/make-release.mjs --notes "本次更新说明"
 ```
 dsh-remote-control/
 ├── src/
-│   ├── index.ts        # 插件主体：工具注册、部署流程、设置页 API
+│   ├── index.ts        # 插件主体：工具注册、部署流程、面板 API
 │   ├── agent-http.ts   # 控制器侧 HTTP 客户端（超时/重定向/回退策略）
 │   ├── registry.ts     # 机器登记表读写（含 activeMachineId）
 │   ├── catalog.ts      # 状态探测与 15 秒缓存
 │   ├── execution.ts    # cwd/env 解析与默认值合并
 │   ├── reverse.ts      # 反向隧道网关
-│   └── client/index.ts # 前端：设置页面板 + 输入框上方目标条
+│   └── client/index.ts # 前端：侧栏面板 + 输入框目标条
 ├── agent/
 │   └── dsh-remote-agent.mjs   # 目标机零依赖 agent（单文件）
 ├── scripts/            # 构建与自动化测试

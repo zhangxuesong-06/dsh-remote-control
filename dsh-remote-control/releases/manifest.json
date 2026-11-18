@@ -1,7 +1,7 @@
 {
-  "version": "0.14.0",
-  "tarball": "dsh-external-dsh-remote-control-0.14.0.tgz",
-  "sha256": "59c0e607416164e2293e215a43ca7e04e816db5ebfbd63a6ddd33bb16efef55b",
-  "notes": "自动更新",
-  "publishedAt": "2026-11-17T11:17:31.021Z"
+  "version": "0.15.3",
+  "tarball": "dsh-external-dsh-remote-control-0.15.3.tgz",
+  "sha256": "31e069914c895d5463788ca878813262bf029ad68851ed42227adab892ace385",
+  "notes": "修复面板滚动与居中，样式更新即时生效",
+  "publishedAt": "2026-11-18T04:44:27.126Z"
 }

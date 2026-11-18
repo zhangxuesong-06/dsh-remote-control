@@ -52,7 +52,13 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
       }
 
       var CSS = [
-        ".dshrc-panel{max-width:760px;display:flex;flex-direction:column;gap:12px;font-size:13px;color:var(--dsw-alias-label-primary)}",
+        // 整页面板：照搬宿主「插件」页的根布局——flex 列 + 居中 + 自身滚动。
+        // 只写 height:100%/overflow:auto 在部分宿主上不生效（外层包裹层高度不确定）。
+        ".dshrc-page{box-sizing:border-box;height:100%;min-height:0;flex:1 1 auto;display:flex;flex-direction:column;align-items:center;gap:16px;padding:0 clamp(20px,4vw,40px) 48px;overflow:auto;scrollbar-gutter:stable}",
+        // flex-shrink:0 很关键：列方向 flex 容器的子项默认会被压缩成等高，于是既不滚动、
+        // 内容还会被挤扁。禁止收缩后，超出高度才会产生滚动条。
+        ".dshrc-page>*{width:100%;max-width:960px;flex:0 0 auto}",
+        ".dshrc-panel{box-sizing:border-box;width:100%;max-width:960px;display:flex;flex-direction:column;gap:12px;padding-top:24px;font-size:13px;color:var(--dsw-alias-label-primary)}",
         ".dshrc-hint{font-size:11px;color:var(--dsw-alias-label-tertiary);margin:0}",
         ".dshrc-form{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;padding:12px;background:var(--dsw-alias-bg-layer-2)}",
         ".dshrc-field{display:flex;flex-direction:column;gap:4px;min-width:130px;flex:1}",
@@ -113,12 +119,19 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
       ].join("");
 
       var tagId = "dsh-remote-control/main.css";
-      if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=\"" + tagId + "\"]") === null) {
-        var tag = document.createElement("style");
-        tag.dataset.plugin = "dsh-remote-control";
-        tag.dataset.pluginCss = tagId;
-        tag.textContent = CSS;
-        document.head.appendChild(tag);
+      if (typeof document !== "undefined") {
+        // Reuse the tag but refresh its text: an already-mounted page keeps the previous
+        // stylesheet otherwise, which makes CSS fixes look like they had no effect.
+        var existing = document.querySelector("style[data-plugin-css=\"" + tagId + "\"]");
+        if (existing === null) {
+          var tag = document.createElement("style");
+          tag.dataset.plugin = "dsh-remote-control";
+          tag.dataset.pluginCss = tagId;
+          tag.textContent = CSS;
+          document.head.appendChild(tag);
+        } else if (existing.textContent !== CSS) {
+          existing.textContent = CSS;
+        }
       }
 
       function field(label, value, onChange, props) {
@@ -659,6 +672,70 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
         return h(react.Fragment, null, modeControl, hostControl);
       }
 
+      // 左侧工作区栏的入口图标（与「插件」「自动化任务」并列）。
+      function RemoteControlIcon(props) {
+        var size = (props && props.size) || 16;
+        return h("svg", {
+          width: size, height: size, viewBox: "0 0 16 16", fill: "none",
+          stroke: "currentColor", strokeWidth: 1.3,
+          strokeLinecap: "round", strokeLinejoin: "round", "aria-hidden": "true",
+        },
+          h("rect", { x: "1.7", y: "2.6", width: "9.2", height: "6.6", rx: "1.1" }),
+          h("path", { d: "M4.6 12.2h3.4M6.3 9.4v2.6" }),
+          h("rect", { x: "8.9", y: "6.4", width: "5.4", height: "7", rx: "1" }),
+        );
+      }
+
+      /**
+       * Keep the page exactly as tall as the space the shell frame gives us.
+       *
+       * CSS `height:100%` only works when the slot's wrapper is stretched; if the host
+       * renders the entry inside an auto-height container the page grows past the frame
+       * (which clips with overflow:hidden) and nothing can scroll. Measuring the frame and
+       * setting a pixel height works in both cases, so scrolling is guaranteed.
+       */
+      function useFillHeight(ref) {
+        react.useEffect(function () {
+          var el = ref.current;
+          if (!el || typeof window === "undefined") return;
+          function apply() {
+            var node = ref.current;
+            if (!node || !node.isConnected) return;
+            var rect = node.getBoundingClientRect();
+            // Nearest shell frame ancestor owns the viewport area; fall back to the window.
+            var frame = null;
+            for (var p = node.parentElement; p; p = p.parentElement) {
+              var cls = typeof p.className === "string" ? p.className : "";
+              if (cls.indexOf("frame") !== -1 || cls.indexOf("centerCol") !== -1) { frame = p; break; }
+            }
+            var base = frame ? frame.getBoundingClientRect() : { top: 0, height: window.innerHeight };
+            var top = Math.max(0, rect.top - base.top);
+            var height = Math.max(240, Math.round(base.height - top));
+            node.style.height = height + "px";
+            node.style.overflowY = "auto";
+          }
+          apply();
+          var later = window.setTimeout(apply, 80);
+          var ro = null;
+          if (typeof ResizeObserver !== "undefined") {
+            ro = new ResizeObserver(function () { apply(); });
+            if (el.parentElement) ro.observe(el.parentElement);
+          }
+          window.addEventListener("resize", apply);
+          return function () {
+            window.clearTimeout(later);
+            if (ro) ro.disconnect();
+            window.removeEventListener("resize", apply);
+          };
+        }, []);
+      }
+
+      function RemoteControlPage() {
+        var pageRef = react.useRef(null);
+        useFillHeight(pageRef);
+        return h("div", { className: "dshrc-page", ref: pageRef }, h(RemoteControlSection, null));
+      }
+
       function RemoteControlSection() {
         var [form, setForm] = react.useState({ id: "", name: "", host: "", username: "", password: "", os: "auto", port: "5188", sshPort: "22", transport: "ssh", tunnelHost: "", tunnelPort: "22", tunnelForwardHost: "", workspace: "", tunnelUrl: "", autoConnect: false });
         var [busy, setBusy] = react.useState("");
@@ -1061,23 +1138,58 @@ if (typeof window !== "undefined" && window.__ModuleLoader__) {
       }
 
       function apply(ctx) {
+        var PANEL_ID = "dsh-remote-control";
+        // 面板入口放在左侧工作区栏（与「插件」「自动化任务」并列），不再是设置页里的一个区块。
+        // 若宿主没有提供这两个插槽（旧版本），回退到设置页，保证仍然可达。
+        var placed = false;
         try {
           ctx.effect(function () {
-            return ctx.slots.inject("settings.section", function () {
+            return ctx.slots.inject("sidebar.panellist", function () {
               return ctx.slots.register({
-                name: "settings.section",
-                id: "dsh-remote-control",
-                order: 28,
-                label: function () { return "远程控制"; },
+                name: "sidebar.panellist",
+                id: PANEL_ID,
+                order: 20,
                 locale: "dshRemoteControl",
-              }, function () { return h(RemoteControlSection); });
+                label: function () { return "远程控制"; },
+              }, function (props) { return h(RemoteControlIcon, props); });
             });
-          }, "dsh-remote-control: settings section");
+          }, "dsh-remote-control: sidebar entry");
+          ctx.effect(function () {
+            return ctx.slots.inject("main", function () {
+              return ctx.slots.register({
+                name: "main",
+                key: PANEL_ID,
+                locale: "dshRemoteControl",
+              }, function () { return h(RemoteControlPage, null); });
+            });
+          }, "dsh-remote-control: sidebar panel page");
+          placed = true;
         } catch (error) {
           try {
-            console.error("[dsh-remote-control] 设置面板注册失败（已降级，不影响客户端启动）:", error);
+            console.error("[dsh-remote-control] 侧栏入口注册失败，回退到设置页:", error);
           } catch {
-            // 控制台都不可用时彻底静默。
+            // 控制台不可用时静默。
+          }
+        }
+        if (!placed) {
+          try {
+            ctx.effect(function () {
+              return ctx.slots.inject("settings.section", function () {
+                return ctx.slots.register({
+                  name: "settings.section",
+                  id: PANEL_ID,
+                  order: 28,
+                  label: function () { return "远程控制"; },
+                  locale: "dshRemoteControl",
+                }, function () { return h(RemoteControlSection, null); });
+              });
+            }, "dsh-remote-control: settings section (fallback)");
+          } catch (error) {
+            try {
+              console.error("[dsh-remote-control] 设置面板注册失败（已降级，不影响客户端启动）:", error);
+            } catch {
+              // 控制台都不可用时彻底静默。
+            }
           }
         }
         // 聊天框工具行内的紧凑控件（Codex 风格）。独立 try：
